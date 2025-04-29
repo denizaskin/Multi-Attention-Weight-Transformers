@@ -9,7 +9,7 @@ The **Multi-Attention-Weight Transformer (MAWT)** introduces a novel enhancement
 ```
 
 
-to a 5D structure: ([attention、self-attention、transformer和bert模型基本原理简述笔记-CSDN博客](https://blog.csdn.net/weixin_33836874/article/details/92416415?utm_source=chatgpt.com))
+to a 5D structure:
 
 ```
 (batch_size, num_heads, seq_len_query, seq_len_key, depth)
