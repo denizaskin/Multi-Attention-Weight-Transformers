@@ -1,4 +1,3 @@
-[![Router-Tuning: A Simple and Effective Approach for Enabling Dynamic ...](https://tse1.mm.bing.net/th?id=OIP.IBBf9CZeJjScE-mHfqFaSQHaCe&pid=Api)](https://www.aimodels.fyi/papers/arxiv/router-tuning-simple-effective-approach-enabling-dynamic)
 # MAWT: Multi-Attention-Weight Transformer
 
 ## 🧠 Overview
