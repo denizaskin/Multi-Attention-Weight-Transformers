@@ -1,83 +1,89 @@
-# MAWT: Multi-Attention-Weight Transformer
+# MAW Reranker
 
-## 🧠 Overview
+This project provides a reproduction-ready reranking pipeline that compares a Multi-Attention Window (MAW) variant of a cross-encoder against a non-MAW baseline on standard IR benchmarks (MS MARCO dev, TREC DL, and selected BEIR tasks). Candidate pools are generated using BM25, re-ranked with identical pools across variants, and evaluated with official trec-style metrics via `ir_measures`. The codebase also logs MAW depth statistics, performs multi-seed runs, calculates significance tests, and emits experiment artifacts for paper-grade reporting.
 
-The **Multi-Attention-Weight Transformer (MAWT)** introduces a novel enhancement to the traditional Transformer architecture by incorporating an additional **depth dimension** into the self-attention mechanism. This modification transforms the standard attention tensor from a 4D structure:
+## Key Features
+- **True reranking setup**: Top-1000 candidate pools built with Pyserini/ir\_datasets and cached to `runs/<dataset>/bm25_top1000.trec`.
+- **Variant framework**: Toggle MAW injection depth, gating modes, LoRA fine-tuning, and hyperparameter sweeps through `VariantConfig` definitions.
+- **Official metrics**: Uses `ir_measures` for MRR@10, nDCG@10, and recall@1000 depending on dataset.
+- **Multi-seed evaluation**: Runs each variant over ≥3 seeds, aggregates mean±std, and applies paired t-tests (SciPy) on per-query gains.
+- **MAW introspection**: Logs depth-weight distributions to JSONL for later analysis.
+- **Experiment artifacts**: Saves runfiles, per-query metrics, depth logs, configs, environment metadata, git commit, and system info to `experiments/`.
+- **One-click scripts**: `build_bm25.sh`, `gen_pools.sh`, `rerank_eval.sh`, and `suite_runner.sh` orchestrate the common workflows.
 
+## Environment Setup
+1. **Create virtual environment** (optional):
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   ```
+2. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+   Alternatively, use Conda:
+   ```bash
+   conda env create -f environment.yml
+   conda activate maw-reranker
+   ```
+3. **Optional services**:
+   - Set `ENABLE_WANDB=1` and export `WANDB_API_KEY` if you want Weights & Biases logging.
+
+## Preparing Candidate Pools
+All reranking requires BM25 pools per dataset:
+```bash
+./build_bm25.sh                          # primary benchmarks
+./gen_pools.sh                           # build for all registered datasets
+python MAW_reranker.py --mode build-pools --datasets MSMARCO/dev-small
 ```
-(batch_size, num_heads, seq_len_query, seq_len_key)
+Use `--force-pools` to refresh cached runs.
+
+## Running Experiments
+### Full Suite (defaults + ablations + dev sweep)
+```bash
+./suite_runner.sh
 ```
+This expands the dataset list with secondary BEIR tasks, runs all registered variants, and performs a dev-only hyperparameter sweep on MS MARCO.
 
-
-to a 5D structure:
-
+### Baseline vs MAW (minimal)
+```bash
+./rerank_eval.sh MSMARCO/dev-small TREC-DL-2019-passage
 ```
-(batch_size, num_heads, seq_len_query, seq_len_key, depth)
-```
+Runs only the default variants (`non_maw`, `maw_default`).
 
+### CLI Options
+`python MAW_reranker.py --help` summarizes available flags. Common patterns:
+- `--mode suite|build-pools|dev-sweep`
+- `--datasets <space separated dataset keys>`
+- `--variants default|ablations|all`
+- `--include-secondary` to append BEIR sanity datasets
+- `--with-dev-sweep` to enable the MS MARCO hyperparameter grid
+- `--seeds 13 17 29` to override seed list
 
-This added dimension allows the model to capture more nuanced relationships within the data, enabling a richer and more flexible representation of context.
+## Outputs and Artifacts
+Each run is stored under `experiments/<dataset>/<variant>/seed_<seed>/` and contains:
+- `config.json`: configuration, seed, git commit hash, system info.
+- `per_query_metrics.json`: per-query metric values from `ir_measures`.
+- `per_query_scores.jsonl`: reranked document scores for each query.
+- `<variant>_seed<seed>.trec`: TREC-format runfile.
+- `maw_depth.jsonl` (MAW variants): depth routing distributions.
 
-## 🔍 Key Features
+Suite summaries land in `experiments/summary/`, e.g. `suite_<timestamp>.json`.
 
-- **Depth-Enhanced Self-Attention**: By extending the attention mechanism to include a depth dimension, MAWT enables the model to process information across multiple representational layers simultaneously. This facilitates a more comprehensive understanding of complex patterns and dependencies within the data.
+## Variant Catalogue
+Key variants defined in `MAW_reranker.py`:
+- `non_maw`: baseline without MAW injection.
+- `maw_default`: MAW injected into the final attention layer (`inject_last_k=1`).
+- Ablations: depth sizes (`maw_depth1`, `maw_depth4`, `maw_depth8`), gating modes (`uniform`, `random`, `argmax`), multiple layer injection (`maw_inject_last2`), and LoRA fine-tuning (`maw_lora_finetune`).
+- Dev sweep (MS MARCO): grid over `maw_strength ∈ {0.02,0.03,0.05}` × `depth_dim ∈ {4,8}`.
 
-- **Dynamic Depth Selection**: MAWT employs a **Group Relative Policy Optimization (GRPO)**-based selector to dynamically determine the most relevant depth slices for each input. During training, this selector learns to focus on the depth dimensions that contribute most significantly to the model's performance, allowing for adaptive and context-sensitive attention.
+## Troubleshooting
+- **`ir_measures` missing**: install via `pip install ir-measures` (already listed in requirements).
+- **`pyserini` index errors**: ensure Java is installed and that prebuilt indexes are accessible; rerun with `--force-pools` if runs are corrupt.
+- **`scipy` missing**: install for significance tests (`pip install scipy`).
+- **`git` errors when logging commit hash**: run inside a git repo or ignore the warning.
+- **WANDB credential prompts**: set `WANDB_API_KEY` env var or leave `ENABLE_WANDB` unset to skip logging.
 
-- **Modified Attention Mechanism**: The traditional attention computation is augmented to handle the additional depth dimension. This involves learnable transformations that operate across the depth slices, enabling the model to integrate information from multiple depths effectively.
+## Citation
+If you build on this work, please cite the original MAW reranker paper (add once published) and the Pyserini/ir\_datasets tooling that powers candidate retrieval.
 
-- **GRPO Fine-Tuning**: The integration of GRPO allows for reinforcement learning-based fine-tuning of the depth selection strategy. By treating the selection of depth slices as actions and optimizing for performance-based rewards, the model learns to make more informed and effective depth selections over time.
-
-## 🛠️ Components
-
-### 1. GRPO-Based Depth Selector
-
-The `GRPODepthSelector` module analyzes the 5D attention tensor to compute probabilities over the depth dimension. During training, it samples depth indices based on these probabilities, allowing the model to explore various depth combinations. During inference, it selects the most probable depth slice, ensuring consistent and optimized performance.
-
-### 2. Modified Mistral Attention Layer
-
-The `ModifiedMistralAttention` layer extends the standard attention mechanism to operate over the additional depth dimension. It applies learnable transformations across depth slices, enabling the model to capture complex interactions and dependencies that span multiple representational layers.
-
-### 3. Custom Trainer with GRPO Loss
-
-The `CustomTrainer` class incorporates a GRPO-based loss function that combines cross-entropy loss with a policy loss derived from the depth selection probabilities. This approach encourages the model to learn effective depth selection strategies that enhance overall performance.
-
-## 📊 Training and Evaluation
-
-- **Dataset**: The model is trained on the "nuprl/verbal-reasoning-challenge" dataset, which presents tasks requiring advanced reasoning capabilities.
-
-- **Model**: MAWT builds upon the "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" model, leveraging its robust architecture as a foundation for the enhanced attention mechanism.
-
-- **Training Strategy**: The model undergoes fine-tuning using the GRPO approach, allowing it to learn optimal depth selection strategies that improve its reasoning and decision-making abilities.
-
-## 🚀 Getting Started
-
-1. **Load the Model**: Initialize the base model and tokenizer from the specified pre-trained model.
-
-2. **Modify Attention**: Replace the last attention layer with the `ModifiedMistralAttention` layer to enable dynamic depth selection.
-
-3. **Freeze Layers**: Freeze all layers except the last one to focus training on the modified attention mechanism.
-
-4. **Prepare Dataset**: Load and preprocess the dataset, ensuring it's properly tokenized and formatted for training.
-
-5. **Train the Model**: Fine-tune the model using the `CustomTrainer`, which incorporates the GRPO loss function to guide the learning process.
-
-6. **Evaluate Performance**: Assess the model's performance on held-out test data to measure improvements in reasoning capabilities.
-
-## 📈 Results
-
-The integration of a depth dimension and dynamic depth selection in MAWT has demonstrated enhanced performance in reasoning tasks. By allowing the model to adaptively focus on different representational layers, it captures more complex patterns and dependencies, leading to more accurate and insightful responses.
-
-## 🧪 Future Work
-
-- **Expand Depth Dimensions**: Explore the impact of increasing the number of depth slices to capture even richer representations.
-
-- **Broader Applications**: Apply the MAWT architecture to other domains, such as code generation or mathematical problem-solving, to assess its versatility.
-
-- **Enhanced Training Techniques**: Investigate alternative reinforcement learning strategies to further improve the model's depth selection capabilities.
-
----
-
-*Note: The MAWT architecture builds upon concepts introduced in the DeepSeekMath paper, which explores the use of GRPO for enhancing mathematical reasoning in language models.*
-
---- 

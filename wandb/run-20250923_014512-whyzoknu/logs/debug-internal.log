@@ -1,0 +1,6 @@
+{"time":"2025-09-23T01:45:12.499276+03:00","level":"INFO","msg":"stream: starting","core version":"0.21.4"}
+{"time":"2025-09-23T01:45:13.122872+03:00","level":"INFO","msg":"stream: created new stream","id":"whyzoknu"}
+{"time":"2025-09-23T01:45:13.123102+03:00","level":"INFO","msg":"handler: started","stream_id":"whyzoknu"}
+{"time":"2025-09-23T01:45:13.123133+03:00","level":"INFO","msg":"sender: started","stream_id":"whyzoknu"}
+{"time":"2025-09-23T01:45:13.123151+03:00","level":"INFO","msg":"writer: started","stream_id":"whyzoknu"}
+{"time":"2025-09-23T01:45:13.123331+03:00","level":"INFO","msg":"stream: started","id":"whyzoknu"}

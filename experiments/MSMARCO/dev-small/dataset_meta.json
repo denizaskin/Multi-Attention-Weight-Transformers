@@ -1,0 +1,6 @@
+{
+  "dataset": "MSMARCO/dev-small",
+  "description": "MS MARCO passage dev small (official 6980 queries)",
+  "candidate_run": "runs/MSMARCO/dev-small/bm25_top1000.trec",
+  "topk": 1000
+}
