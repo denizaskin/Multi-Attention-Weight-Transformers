@@ -6,3 +6,5 @@ __pycache__/
 .DS_Store
 .env.env
 .env
+key_mawt
+key_mawt.pub
