@@ -1,6 +1,0 @@
-{"time":"2025-09-23T10:42:46.101231+03:00","level":"INFO","msg":"stream: starting","core version":"0.21.4"}
-{"time":"2025-09-23T10:42:46.539258+03:00","level":"INFO","msg":"stream: created new stream","id":"pe1mgr30"}
-{"time":"2025-09-23T10:42:46.539299+03:00","level":"INFO","msg":"stream: started","id":"pe1mgr30"}
-{"time":"2025-09-23T10:42:46.539303+03:00","level":"INFO","msg":"handler: started","stream_id":"pe1mgr30"}
-{"time":"2025-09-23T10:42:46.539314+03:00","level":"INFO","msg":"sender: started","stream_id":"pe1mgr30"}
-{"time":"2025-09-23T10:42:46.539328+03:00","level":"INFO","msg":"writer: started","stream_id":"pe1mgr30"}

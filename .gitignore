@@ -1,11 +1,73 @@
-runs/
-experiments/
-results_logs/
-*.pyc
+# Python cache
 __pycache__/
-.DS_Store
-.env.env
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Data files
+*.json
+!requirements.txt
+!package.json
+!*.config.json
+*results*
+*data*
+*dataset*
+*benchmark*
+*.csv
+*.tsv
+
+# Model files
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.pkl
+*.pickle
+
+# Logs
+*.log
+logs/
+*output*
+*summary*
+
+# VS Code
+.vscode/
+*.vsix
+
+# Environment
 .env
-key_mawt
-key_mawt.pub
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+
+# Large files
+*.zip
+*.tar.gz
+*.rar
 
