@@ -650,7 +650,7 @@ class MAWWithGRPOEncoder(nn.Module):
         
         return output
 
-def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.7, device: torch.device = None) -> Tuple[
+def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.8, device: torch.device = None) -> Tuple[
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]],  # train
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]]   # test
 ]:
@@ -1074,8 +1074,8 @@ Examples:
                        help='Number of training epochs (default: 20)')
     parser.add_argument('--device', type=str, choices=['cuda', 'cpu', 'auto'], default='auto',
                        help='Device to use: cuda, cpu, or auto (default: auto)')
-    parser.add_argument('--train-ratio', type=float, default=0.7,
-                       help='Train/test split ratio (default: 0.7)')
+    parser.add_argument('--train-ratio', type=float, default=0.8,
+                       help='Train/test split ratio (default: 0.8)')
     parser.add_argument('--k-values', type=int, nargs='+', default=[1, 5, 10, 100, 1000],
                        help='K values for metrics (default: 1 5 10 100 1000)')
     

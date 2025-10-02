@@ -373,7 +373,7 @@ class MAWWithSupervisedClassificationEncoder(nn.Module):
         
         return output
 
-def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.7, device: torch.device = None) -> Tuple[
+def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.8, device: torch.device = None) -> Tuple[
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]],  # train
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]]   # test
 ]:
@@ -383,7 +383,7 @@ def create_benchmark_dataset_split(dataset_name: str, config: Config, train_rati
     Args:
         dataset_name: One of the benchmark dataset keys
         config: Model configuration
-        train_ratio: Ratio for training split (default 0.7)
+        train_ratio: Ratio for training split (default 0.8)
         device: Device to create tensors on (if None, uses CUDA if available)
         
     Returns:
@@ -462,14 +462,23 @@ def create_benchmark_dataset_split(dataset_name: str, config: Config, train_rati
         all_documents.append(query_docs)
         all_relevance_scores.append(query_relevance)
     
-    # Split into train and test
-    train_queries = all_queries[:num_train]
-    train_documents = all_documents[:num_train]
-    train_relevance = all_relevance_scores[:num_train]
+    # Split into train/test with shuffling (same approach as GRPO for consistency)
+    train_size = int(total_queries * train_ratio)
+    indices = list(range(total_queries))
+    random.shuffle(indices)
     
-    test_queries = all_queries[num_train:]
-    test_documents = all_documents[num_train:]
-    test_relevance = all_relevance_scores[num_train:]
+    train_indices = indices[:train_size]
+    test_indices = indices[train_size:]
+    
+    # Create train split
+    train_queries = [all_queries[i] for i in train_indices]
+    train_documents = [all_documents[i] for i in train_indices]
+    train_relevance = [all_relevance_scores[i] for i in train_indices]
+    
+    # Create test split
+    test_queries = [all_queries[i] for i in test_indices]
+    test_documents = [all_documents[i] for i in test_indices]
+    test_relevance = [all_relevance_scores[i] for i in test_indices]
     
     return (train_queries, train_documents, train_relevance), (test_queries, test_documents, test_relevance)
 
@@ -849,8 +858,8 @@ Examples:
                        help='Number of training epochs (default: 10)')
     parser.add_argument('--device', type=str, choices=['cuda', 'cpu', 'auto'], default='auto',
                        help='Device to use: cuda, cpu, or auto (default: auto)')
-    parser.add_argument('--train-ratio', type=float, default=0.7,
-                       help='Train/test split ratio (default: 0.7)')
+    parser.add_argument('--train-ratio', type=float, default=0.8,
+                       help='Train/test split ratio (default: 0.8)')
     parser.add_argument('--k-values', type=int, nargs='+', default=[1, 5, 10, 100, 1000],
                        help='K values for metrics (default: 1 5 10 100 1000)')
     
