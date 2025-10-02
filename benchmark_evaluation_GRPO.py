@@ -12,6 +12,19 @@ Datasets evaluated:
 Metrics: Hit Rate, MRR, NDCG @ K=1,5,10,100,1000
 
 This version implements actual GRPO Reinforcement Learning for depth selection.
+
+Usage:
+    # Run on all datasets with GPU (if available)
+    python benchmark_evaluation_GRPO.py
+    
+    # Run on specific dataset with limited samples
+    python benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 20 --epochs 10
+    
+    # Run on CPU only
+    python benchmark_evaluation_GRPO.py --device cpu --samples 15
+    
+    # Run on multiple datasets
+    python benchmark_evaluation_GRPO.py --datasets MS_MARCO TREC_DL --samples 30
 """
 
 import torch
@@ -24,6 +37,12 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Any
 import random
+import argparse
+import sys
+import json
+import os
+from datetime import datetime
+from pathlib import Path
 
 @dataclass
 class Config:
@@ -539,9 +558,9 @@ class MAWWithGRPOEncoder(nn.Module):
         self.key_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.value_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         
-        # Depth-aware projections for 5D attention
-        self.depth_query_proj = nn.Linear(self.hidden_dim, self.hidden_dim * self.depth_dim, bias=False)
-        self.depth_key_proj = nn.Linear(self.hidden_dim, self.hidden_dim * self.depth_dim, bias=False)
+        # Depth-aware projections for 5D attention (new method: projects to num_heads * depth_dim)
+        self.depth_query_proj = nn.Linear(self.hidden_dim, self.num_heads * self.depth_dim, bias=False)
+        self.depth_key_proj = nn.Linear(self.hidden_dim, self.num_heads * self.depth_dim, bias=False)
         
         # GRPO RL Router
         self.grpo_router = GRPORouter(config)
@@ -577,31 +596,42 @@ class MAWWithGRPOEncoder(nn.Module):
         K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Reshape depth projections: (batch, seq, hidden*depth) -> (batch, heads, seq, head_dim, depth)
-        Q_depth = Q_depth.view(batch_size, seq_len, self.num_heads, self.head_dim, self.depth_dim).transpose(1, 2)
-        K_depth = K_depth.view(batch_size, seq_len, self.num_heads, self.head_dim, self.depth_dim).transpose(1, 2)
+        # NEW 5D ATTENTION COMPUTATION METHOD:
+        # Reshape depth projections: (batch, seq, heads*depth) -> (batch, heads, seq, depth)
+        Q_depth = Q_depth.view(batch_size, seq_len, self.num_heads, self.depth_dim).transpose(1, 2)
+        # Shape: (batch_size, num_heads, sequence_length_query, depth)
         
-        # Compute 5D attention weights across all depths
-        attention_weights_5d = torch.zeros(batch_size, self.num_heads, seq_len, seq_len, self.depth_dim,
-                                          device=hidden_states.device, dtype=hidden_states.dtype)
+        K_depth = K_depth.view(batch_size, seq_len, self.num_heads, self.depth_dim).transpose(1, 2)
+        # Shape: (batch_size, num_heads, sequence_length_key, depth)
         
-        for depth_idx in range(self.depth_dim):
-            # Extract Q, K for this depth: (batch, heads, seq, head_dim)
-            q_d = Q_depth[:, :, :, :, depth_idx]
-            k_d = K_depth[:, :, :, :, depth_idx]
-            
-            # Compute attention scores for this depth
-            scores = torch.matmul(q_d, k_d.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            
-            # Apply attention mask if provided
-            if attention_mask is not None:
-                mask = attention_mask.unsqueeze(1).unsqueeze(1)  # (batch, 1, 1, seq)
-                mask = mask.expand(batch_size, self.num_heads, seq_len, seq_len)
-                scores = scores.masked_fill(mask == 0, -1e9)
-            
-            # Convert to attention weights and store in 5D tensor
-            attention_weights = F.softmax(scores, dim=-1)
-            attention_weights_5d[:, :, :, :, depth_idx] = attention_weights
+        # Step 2: Expand Q_depth and transpose
+        # (batch, heads, seq_q, depth) -> (batch, heads, depth, seq_q, 1)
+        Q_depth_expanded = Q_depth.transpose(2, 3).unsqueeze(-1)
+        
+        # Step 3: Expand K_depth (already transposed)
+        # (batch, heads, seq_k, depth) -> (batch, heads, depth, 1, seq_k)
+        K_depth_expanded = K_depth.transpose(2, 3).unsqueeze(-2)
+        
+        # Step 4: Element-wise multiply with broadcasting
+        # (batch, heads, depth, seq_q, 1) * (batch, heads, depth, 1, seq_k)
+        # = (batch, heads, depth, seq_q, seq_k)
+        scores_5d = Q_depth_expanded * K_depth_expanded
+        
+        # Transpose to (batch, heads, seq_q, seq_k, depth)
+        scores_5d = scores_5d.permute(0, 1, 3, 4, 2)
+        
+        # Step 5: Scale by sqrt(depth) and apply softmax
+        scores_5d = scores_5d / math.sqrt(self.depth_dim)
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(1).unsqueeze(1).unsqueeze(-1)  # (batch, 1, 1, seq, 1)
+            mask = mask.expand(batch_size, self.num_heads, seq_len, seq_len, self.depth_dim)
+            scores_5d = scores_5d.masked_fill(mask == 0, -1e9)
+        
+        # Softmax over depth dimension (dim=-1)
+        attention_weights_5d = F.softmax(scores_5d, dim=-1)
+        # Shape: (batch_size, num_heads, sequence_length_query, sequence_length_key, depth)
         
         # GRPO RL: Select optimal 4D attention weights from 5D attention weights
         # Input: (batch, heads, seq_q, seq_k, depth) -> Output: (batch, heads, seq_q, seq_k)
@@ -620,12 +650,18 @@ class MAWWithGRPOEncoder(nn.Module):
         
         return output
 
-def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.7) -> Tuple[
+def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.7, device: torch.device = None) -> Tuple[
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]],  # train
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]]   # test
 ]:
     """
     Create realistic benchmark dataset with proper train/test split
+    
+    Args:
+        dataset_name: Name of the dataset
+        config: Configuration object
+        train_ratio: Ratio of training data
+        device: Device to create tensors on (if None, uses CUDA if available)
     
     Returns:
         train_data: (queries, documents, relevance_scores)
@@ -636,7 +672,8 @@ def create_benchmark_dataset_split(dataset_name: str, config: Config, train_rati
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
     dataset_config = BENCHMARK_DATASETS[dataset_name]
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     total_queries = dataset_config["num_queries"]
     num_docs_per_query = dataset_config["num_docs_per_query"]
@@ -752,29 +789,30 @@ def train_grpo_rl_on_dataset(model: MAWWithGRPOEncoder, queries: List[torch.Tens
                     sim_baseline = F.cosine_similarity(query_repr_baseline, doc_repr_baseline, dim=-1)
                     baseline_scores.append(sim_baseline.item())
             
-            # Get 5D attention weights from MAW model
+            # Get 5D attention weights from MAW model (NEW METHOD)
             # We need to extract them from the forward pass
             with torch.no_grad():
                 # Get Q_depth, K_depth for 5D attention computation
-                Q_depth = model.depth_query_proj(query)
-                K_depth = model.depth_key_proj(query)
+                Q_depth = model.depth_query_proj(query)  # (1, seq, num_heads * depth_dim)
+                K_depth = model.depth_key_proj(query)    # (1, seq, num_heads * depth_dim)
                 
                 # Reshape for 5D attention
                 seq_len = query.shape[1]
-                Q_depth = Q_depth.view(1, seq_len, model.num_heads, model.head_dim, model.depth_dim).transpose(1, 2)
-                K_depth = K_depth.view(1, seq_len, model.num_heads, model.head_dim, model.depth_dim).transpose(1, 2)
+                Q_depth = Q_depth.view(1, seq_len, model.num_heads, model.depth_dim).transpose(1, 2)
+                # Shape: (1, num_heads, seq, depth)
+                K_depth = K_depth.view(1, seq_len, model.num_heads, model.depth_dim).transpose(1, 2)
+                # Shape: (1, num_heads, seq, depth)
                 
-                # Compute 5D attention weights
-                attention_weights_5d = torch.zeros(1, model.num_heads, seq_len, seq_len, model.depth_dim,
-                                                  device=device, dtype=query.dtype)
+                # NEW 5D attention computation
+                Q_depth_expanded = Q_depth.transpose(2, 3).unsqueeze(-1)  # (1, heads, depth, seq, 1)
+                K_depth_expanded = K_depth.transpose(2, 3).unsqueeze(-2)  # (1, heads, depth, 1, seq)
                 
-                for depth_idx in range(model.depth_dim):
-                    q_d = Q_depth[0, :, :, :, depth_idx]
-                    k_d = K_depth[0, :, :, :, depth_idx]
-                    
-                    scores = torch.matmul(q_d, k_d.transpose(-2, -1)) / math.sqrt(model.head_dim)
-                    attention_weights = F.softmax(scores, dim=-1)
-                    attention_weights_5d[0, :, :, :, depth_idx] = attention_weights
+                scores_5d = Q_depth_expanded * K_depth_expanded  # (1, heads, depth, seq, seq)
+                scores_5d = scores_5d.permute(0, 1, 3, 4, 2)  # (1, heads, seq, seq, depth)
+                scores_5d = scores_5d / math.sqrt(model.depth_dim)
+                
+                attention_weights_5d = F.softmax(scores_5d, dim=-1)  # Softmax over depth dimension
+                # Shape: (1, num_heads, seq, seq, depth)
             
             # Compute GRPO RL loss
             grpo_loss = model.grpo_router.compute_grpo_loss(
@@ -928,32 +966,187 @@ def print_dataset_results(dataset_name: str, model_results: Dict[str, Dict[str, 
         
         print("-" * 100)
 
+def save_results_to_file(all_results: Dict, config: Dict, run_info: Dict, log_dir: str = "logs"):
+    """
+    Save benchmark results to JSON and text files with timestamp.
+    
+    Args:
+        all_results: Dictionary containing all dataset results
+        config: Configuration dictionary with model/training parameters
+        run_info: Dictionary with run metadata (device, datasets, samples, etc.)
+        log_dir: Directory to save logs (default: "logs")
+    """
+    # Create logs directory if it doesn't exist
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Generate timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Prepare complete results structure
+    complete_results = {
+        "timestamp": timestamp,
+        "run_info": run_info,
+        "config": config,
+        "results": all_results
+    }
+    
+    # Save JSON (machine-readable)
+    json_path = os.path.join(log_dir, f"benchmark_grpo_{timestamp}.json")
+    with open(json_path, 'w') as f:
+        json.dump(complete_results, f, indent=2)
+    print(f"\n💾 Results saved to: {json_path}")
+    
+    # Save human-readable text summary
+    txt_path = os.path.join(log_dir, f"benchmark_grpo_{timestamp}.txt")
+    with open(txt_path, 'w') as f:
+        f.write("=" * 100 + "\n")
+        f.write("MAW vs NON-MAW Evaluation with GRPO RL Algorithm\n")
+        f.write("=" * 100 + "\n\n")
+        
+        # Run information
+        f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Device: {run_info['device']}\n")
+        f.write(f"Datasets: {', '.join(run_info['datasets'])}\n")
+        f.write(f"Samples per dataset: {run_info['samples']}\n")
+        f.write(f"Epochs: {run_info['epochs']}\n")
+        f.write(f"Train/Test Split: {run_info['train_ratio']:.0%}/{1-run_info['train_ratio']:.0%}\n")
+        f.write(f"K values: {run_info['k_values']}\n\n")
+        
+        # Configuration
+        f.write(f"Configuration:\n")
+        for key, value in config.items():
+            f.write(f"  {key}: {value}\n")
+        f.write("\n")
+        
+        # Results for each dataset
+        for dataset_name, dataset_results in all_results.items():
+            f.write("=" * 100 + "\n")
+            f.write(f"DATASET: {dataset_name}\n")
+            f.write("=" * 100 + "\n\n")
+            
+            for model_name in ['NON-MAW', 'MAW+GRPO_RL']:
+                f.write(f"{model_name}:\n")
+                for metric_name in ['Hit Rate', 'MRR', 'NDCG']:
+                    f.write(f"  {metric_name}:\n")
+                    for k, value in dataset_results[model_name][metric_name].items():
+                        f.write(f"    K={k}: {value:.4f}\n")
+                f.write("\n")
+        
+        f.write("=" * 100 + "\n")
+        f.write("End of Report\n")
+        f.write("=" * 100 + "\n")
+    
+    print(f"💾 Summary saved to: {txt_path}")
+    
+    return json_path, txt_path
+
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='MAW GRPO Benchmark Evaluation',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run on all datasets with GPU (auto-detect)
+  python benchmark_evaluation_GRPO.py
+  
+  # Run on specific dataset with limited samples
+  python benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 20 --epochs 10
+  
+  # Force CPU usage
+  python benchmark_evaluation_GRPO.py --device cpu --samples 15
+  
+  # Run on multiple specific datasets
+  python benchmark_evaluation_GRPO.py --datasets MS_MARCO TREC_DL Natural_Questions --samples 30
+  
+  # Custom K values for metrics
+  python benchmark_evaluation_GRPO.py --dataset FiQA --k-values 1 5 10 20
+        """
+    )
+    
+    parser.add_argument('--dataset', type=str, choices=list(BENCHMARK_DATASETS.keys()),
+                       help='Single dataset to evaluate')
+    parser.add_argument('--datasets', type=str, nargs='+', choices=list(BENCHMARK_DATASETS.keys()),
+                       help='Multiple datasets to evaluate')
+    parser.add_argument('--samples', type=int, default=None,
+                       help='Number of query samples per dataset (default: use full dataset)')
+    parser.add_argument('--epochs', type=int, default=20,
+                       help='Number of training epochs (default: 20)')
+    parser.add_argument('--device', type=str, choices=['cuda', 'cpu', 'auto'], default='auto',
+                       help='Device to use: cuda, cpu, or auto (default: auto)')
+    parser.add_argument('--train-ratio', type=float, default=0.7,
+                       help='Train/test split ratio (default: 0.7)')
+    parser.add_argument('--k-values', type=int, nargs='+', default=[1, 5, 10, 100, 1000],
+                       help='K values for metrics (default: 1 5 10 100 1000)')
+    
+    args = parser.parse_args()
+    
+    # Determine which datasets to run
+    if args.dataset:
+        datasets_to_run = [args.dataset]
+    elif args.datasets:
+        datasets_to_run = args.datasets
+    else:
+        datasets_to_run = list(BENCHMARK_DATASETS.keys())
+    
+    # Override dataset sample sizes if specified
+    original_configs = {}
+    if args.samples:
+        for dataset_name in datasets_to_run:
+            original_configs[dataset_name] = BENCHMARK_DATASETS[dataset_name]['num_queries']
+            BENCHMARK_DATASETS[dataset_name]['num_queries'] = args.samples
+    
     print("🚀 MAW vs NON-MAW Evaluation with Real GRPO RL Algorithm")
     print("Used in Tier-1 Journals/Conferences: SIGIR, WWW, WSDM, CIKM, EMNLP, ACL")
     print("=" * 100)
     
     # Configuration
     config = Config()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    k_values = [1, 5, 10, 100, 1000]
+    
+    # Device selection with detailed info
+    if args.device == 'cuda':
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+            print(f"🎮 Device: GPU (CUDA) - {torch.cuda.get_device_name(0)}")
+            print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            print("⚠️  CUDA requested but not available, falling back to CPU")
+            device = torch.device('cpu')
+            print(f"🖥️  Device: CPU")
+    elif args.device == 'cpu':
+        device = torch.device('cpu')
+        print(f"🖥️  Device: CPU (forced)")
+    else:  # auto
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device.type == 'cuda':
+            print(f"🎮 Device: GPU (CUDA) - {torch.cuda.get_device_name(0)}")
+            print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            print(f"🖥️  Device: CPU")
+    
+    k_values = args.k_values
     
     print(f"📋 Configuration: hidden_dim={config.hidden_dim}, num_heads={config.num_heads}, depth_dim={config.depth_dim}")
-    print(f"🔧 Device: {device} | Evaluation metrics: Hit Rate, MRR, NDCG @ K={k_values}")
+    print(f"🔧 Training: {args.epochs} epochs | Train/Test Split: {args.train_ratio:.0%}/{1-args.train_ratio:.0%}")
+    print(f"📊 Evaluation metrics: Hit Rate, MRR, NDCG @ K={k_values}")
+    print(f"📚 Datasets to evaluate: {', '.join(datasets_to_run)}")
+    if args.samples:
+        print(f"🔢 Sample size: {args.samples} queries per dataset")
     print()
     
-    # Evaluate on all benchmark datasets
+    # Evaluate on selected benchmark datasets
     all_results = {}
     
-    for dataset_idx, dataset_name in enumerate(BENCHMARK_DATASETS.keys(), 1):
+    for dataset_idx, dataset_name in enumerate(datasets_to_run, 1):
         print("=" * 100)
-        print(f"DATASET {dataset_idx}/5: {BENCHMARK_DATASETS[dataset_name]['name']}")
+        print(f"DATASET {dataset_idx}/{len(datasets_to_run)}: {BENCHMARK_DATASETS[dataset_name]['name']}")
         print("=" * 100)
         
         # Create train/test split for this dataset
         print(f"📚 Creating {BENCHMARK_DATASETS[dataset_name]['name']} dataset with train/test split...")
+        print(f"   🔧 Data creation device: {device.type.upper()}")
         (train_queries, train_documents, train_relevance), (test_queries, test_documents, test_relevance) = create_benchmark_dataset_split(
-            dataset_name, config, train_ratio=0.7
+            dataset_name, config, train_ratio=args.train_ratio, device=device
         )
         
         print(f"   Domain: {BENCHMARK_DATASETS[dataset_name]['domain']}")
@@ -962,21 +1155,27 @@ def main():
         print(f"   Split: {len(train_queries)} train, {len(test_queries)} test queries")
         
         # Create models
+        print(f"\n🔨 Creating models on {device.type.upper()}...")
         non_maw_model = NonMAWEncoder(config).to(device)
         maw_model = MAWWithGRPOEncoder(config).to(device)
+        print(f"   ✅ NON-MAW model: {sum(p.numel() for p in non_maw_model.parameters())} parameters")
+        print(f"   ✅ MAW+GRPO model: {sum(p.numel() for p in maw_model.parameters())} parameters")
         
         # Evaluate NON-MAW (zero-shot baseline)
         print(f"\n🔍 Evaluating NON-MAW baseline (zero-shot on test set)...")
+        print(f"   🔧 Evaluation device: {device.type.upper()}")
         non_maw_results = evaluate_model_on_dataset(
             non_maw_model, "NON-MAW", test_queries, test_documents, test_relevance, device, k_values
         )
         
         # Train MAW+GRPO RL on training set
-        print(f"\n🎯 Training MAW+GRPO RL on training set ({len(train_queries)} queries)...")
-        train_grpo_rl_on_dataset(maw_model, train_queries, train_documents, train_relevance, device, epochs=20)
+        print(f"\n🎯 Training MAW+GRPO RL on training set ({len(train_queries)} queries, {args.epochs} epochs)...")
+        print(f"   🔧 Training device: {device.type.upper()}")
+        train_grpo_rl_on_dataset(maw_model, train_queries, train_documents, train_relevance, device, epochs=args.epochs)
         
         # Evaluate MAW+GRPO RL on test set (unseen data!)
         print(f"\n📊 Evaluating MAW+GRPO RL on test set ({len(test_queries)} queries)...")
+        print(f"   🔧 Evaluation device: {device.type.upper()}")
         maw_results = evaluate_model_on_dataset(
             maw_model, "MAW+GRPO_RL", test_queries, test_documents, test_relevance, device, k_values
         )
@@ -993,32 +1192,67 @@ def main():
         
         # Memory cleanup
         del non_maw_model, maw_model
-        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            print(f"\n   🧹 GPU memory cleared")
         gc.collect()
     
-    # Print summary across all datasets
-    print("\n" + "=" * 100)
-    print("📊 FINAL SUMMARY: MAW+GRPO_RL vs NON-MAW across 5 Benchmark Datasets")
-    print("=" * 100)
+    # Restore original configs if modified
+    if args.samples:
+        for dataset_name, original_size in original_configs.items():
+            BENCHMARK_DATASETS[dataset_name]['num_queries'] = original_size
     
-    # Aggregate metrics across datasets
-    aggregated_results = {}
-    for model_name in ['NON-MAW', 'MAW+GRPO_RL']:
-        aggregated_results[model_name] = {}
-        for metric_name in ['Hit Rate', 'MRR', 'NDCG']:
-            aggregated_results[model_name][metric_name] = {}
-            for k in k_values:
-                values = [all_results[dataset][model_name][metric_name][k] for dataset in all_results]
-                aggregated_results[model_name][metric_name][k] = sum(values) / len(values)
-    
-    print_dataset_results("AGGREGATE", aggregated_results, k_values, 
-                         train_size=0, test_size=0)
+    # Print summary across all datasets (only if multiple datasets)
+    if len(datasets_to_run) > 1:
+        print("\n" + "=" * 100)
+        print(f"📊 FINAL SUMMARY: MAW+GRPO_RL vs NON-MAW across {len(datasets_to_run)} Benchmark Datasets")
+        print("=" * 100)
+        
+        # Aggregate metrics across datasets
+        aggregated_results = {}
+        for model_name in ['NON-MAW', 'MAW+GRPO_RL']:
+            aggregated_results[model_name] = {}
+            for metric_name in ['Hit Rate', 'MRR', 'NDCG']:
+                aggregated_results[model_name][metric_name] = {}
+                for k in k_values:
+                    values = [all_results[dataset][model_name][metric_name][k] for dataset in all_results]
+                    aggregated_results[model_name][metric_name][k] = sum(values) / len(values)
+        
+        print_dataset_results("AGGREGATE", aggregated_results, k_values, 
+                             train_size=0, test_size=0)
+    else:
+        print("\n" + "=" * 100)
     
     print(f"\n🎯 Key Insights:")
     print(f"   • MAW with GRPO RL learns optimal depth selection through reinforcement learning")
     print(f"   • Policy network optimizes depth selection based on retrieval performance rewards")
     print(f"   • Environment provides reward signals based on attention quality and relevance alignment")
     print(f"   • Outperforms NON-MAW baseline through learned attention routing strategies")
+    
+    # Save results to files
+    device_info = f"{device.type.upper()}"
+    if device.type == 'cuda':
+        device_info += f" - {torch.cuda.get_device_name(0)}"
+    
+    run_info = {
+        "device": device_info,
+        "datasets": datasets_to_run,
+        "samples": args.samples if args.samples else "full dataset",
+        "epochs": args.epochs,
+        "train_ratio": args.train_ratio,
+        "k_values": k_values
+    }
+    
+    config_dict = {
+        "hidden_dim": config.hidden_dim,
+        "num_heads": config.num_heads,
+        "depth_dim": config.depth_dim,
+        "seq_len": config.seq_len,
+        "vocab_size": config.vocab_size,
+        "dropout": config.dropout
+    }
+    
+    save_results_to_file(all_results, config_dict, run_info)
 
 if __name__ == "__main__":
     main()

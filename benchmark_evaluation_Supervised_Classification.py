@@ -10,6 +10,19 @@ Datasets evaluated:
 5. FiQA Financial QA
 
 Metrics: Hit Rate, MRR, NDCG @ K=1,5,10,100,1000
+
+Usage:
+    # Run on all datasets with GPU (if available)
+    python benchmark_evaluation_Supervised_Classification.py
+    
+    # Run on specific dataset with limited samples
+    python benchmark_evaluation_Supervised_Classification.py --dataset MS_MARCO --samples 20 --epochs 10
+    
+    # Run on CPU only
+    python benchmark_evaluation_Supervised_Classification.py --device cpu --samples 15
+    
+    # Run on multiple datasets
+    python benchmark_evaluation_Supervised_Classification.py --datasets MS_MARCO TREC_DL --samples 30
 """
 
 import torch
@@ -21,6 +34,13 @@ import gc
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Any
+import argparse
+import sys
+import random
+import json
+import os
+from datetime import datetime
+from pathlib import Path
 
 @dataclass
 class Config:
@@ -30,15 +50,7 @@ class Config:
     vocab_size: int = 30000
     dropout: float = 0.1
     use_half_precision: bool = False  # Disabled for compatibility
-         #         # Store results
-        all_results[dataset_name] = {
-            "NON-MAW": non_maw_results,
-            'MAW+SupervisedClassification': maw_results
-        }ate MAW+SupervisedClassification on test set (unseen data!)
-        print(f"\n📊 Evaluating MAW+SupervisedClassification on test set ({len(test_queries)} queries)...")
-        maw_results = evaluate_model_on_dataset(
-            maw_model, "MAW+SupervisedClassification", test_queries, test_documents, test_relevance, device, k_values
-        )able_gradient_checkpointing: bool = False
+    enable_gradient_checkpointing: bool = False
     
     @property
     def depth_dim(self) -> int:
@@ -269,9 +281,9 @@ class MAWWithSupervisedClassificationEncoder(nn.Module):
         self.key_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         self.value_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
         
-        # Depth-aware projections for 5D attention
-        self.depth_query_proj = nn.Linear(self.hidden_dim, self.hidden_dim * self.depth_dim, bias=False)
-        self.depth_key_proj = nn.Linear(self.hidden_dim, self.hidden_dim * self.depth_dim, bias=False)
+        # Depth-aware projections for 5D attention (new method: projects to num_heads * depth_dim)
+        self.depth_query_proj = nn.Linear(self.hidden_dim, self.num_heads * self.depth_dim, bias=False)
+        self.depth_key_proj = nn.Linear(self.hidden_dim, self.num_heads * self.depth_dim, bias=False)
         
         # Supervised Classification Router
         self.supervised_router = SupervisedClassificationRouter(config)
@@ -307,32 +319,42 @@ class MAWWithSupervisedClassificationEncoder(nn.Module):
         K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Reshape for 5D attention: (batch, heads, seq, head_dim, depth)
-        Q_depth = Q_depth.view(batch_size, seq_len, self.num_heads, self.head_dim, self.depth_dim).transpose(1, 2)
-        K_depth = K_depth.view(batch_size, seq_len, self.num_heads, self.head_dim, self.depth_dim).transpose(1, 2)
+        # NEW 5D ATTENTION COMPUTATION METHOD:
+        # Step 1: Reshape depth projections to (batch, heads, seq, depth)
+        Q_depth = Q_depth.view(batch_size, seq_len, self.num_heads, self.depth_dim).transpose(1, 2)
+        # Shape: (batch_size, num_heads, sequence_length_query, depth)
         
-        # Compute 5D attention weights: (batch, heads, seq_q, seq_k, depth)
-        attention_weights_5d = torch.zeros(batch_size, self.num_heads, seq_len, seq_len, self.depth_dim, 
-                                          device=hidden_states.device, dtype=hidden_states.dtype)
+        K_depth = K_depth.view(batch_size, seq_len, self.num_heads, self.depth_dim).transpose(1, 2)
+        # Shape: (batch_size, num_heads, sequence_length_key, depth)
         
-        # Compute attention scores for each depth
-        for depth_idx in range(self.depth_dim):
-            # Extract Q, K for this depth: (batch, heads, seq, head_dim)
-            q_d = Q_depth[:, :, :, :, depth_idx]  # (batch, heads, seq, head_dim)
-            k_d = K_depth[:, :, :, :, depth_idx]  # (batch, heads, seq, head_dim)
-            
-            # Compute attention scores for this depth
-            scores = torch.matmul(q_d, k_d.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            
-            # Apply attention mask if provided
-            if attention_mask is not None:
-                mask = attention_mask.unsqueeze(1).unsqueeze(1)  # (batch, 1, 1, seq)
-                mask = mask.expand(batch_size, self.num_heads, seq_len, seq_len)
-                scores = scores.masked_fill(mask == 0, -1e9)
-            
-            # Convert to attention weights and store in 5D tensor
-            attention_weights = F.softmax(scores, dim=-1)
-            attention_weights_5d[:, :, :, :, depth_idx] = attention_weights
+        # Step 2: Expand Q_depth and transpose
+        # (batch, heads, seq_q, depth) -> (batch, heads, depth, seq_q, 1)
+        Q_depth_expanded = Q_depth.transpose(2, 3).unsqueeze(-1)
+        
+        # Step 3: Expand K_depth (already transposed)
+        # (batch, heads, seq_k, depth) -> (batch, heads, depth, 1, seq_k)
+        K_depth_expanded = K_depth.transpose(2, 3).unsqueeze(-2)
+        
+        # Step 4: Element-wise multiply with broadcasting
+        # (batch, heads, depth, seq_q, 1) * (batch, heads, depth, 1, seq_k)
+        # = (batch, heads, depth, seq_q, seq_k)
+        scores_5d = Q_depth_expanded * K_depth_expanded
+        
+        # Transpose to (batch, heads, seq_q, seq_k, depth)
+        scores_5d = scores_5d.permute(0, 1, 3, 4, 2)
+        
+        # Step 5: Scale by sqrt(depth) and apply softmax
+        scores_5d = scores_5d / math.sqrt(self.depth_dim)
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(1).unsqueeze(1).unsqueeze(-1)  # (batch, 1, 1, seq, 1)
+            mask = mask.expand(batch_size, self.num_heads, seq_len, seq_len, self.depth_dim)
+            scores_5d = scores_5d.masked_fill(mask == 0, -1e9)
+        
+        # Softmax over depth dimension (dim=-1)
+        attention_weights_5d = F.softmax(scores_5d, dim=-1)
+        # Shape: (batch_size, num_heads, sequence_length_query, sequence_length_key, depth)
         
         # Supervised Classification: Select optimal 4D attention weights from 5D attention weights
         # Input: (batch, heads, seq_q, seq_k, depth) -> Output: (batch, heads, seq_q, seq_k)
@@ -351,7 +373,7 @@ class MAWWithSupervisedClassificationEncoder(nn.Module):
         
         return output
 
-def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.7) -> Tuple[
+def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.7, device: torch.device = None) -> Tuple[
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]],  # train
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]]   # test
 ]:
@@ -362,10 +384,14 @@ def create_benchmark_dataset_split(dataset_name: str, config: Config, train_rati
         dataset_name: One of the benchmark dataset keys
         config: Model configuration
         train_ratio: Ratio for training split (default 0.7)
+        device: Device to create tensors on (if None, uses CUDA if available)
         
     Returns:
         (train_queries, train_docs, train_relevance), (test_queries, test_docs, test_relevance)
     """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     dataset_config = BENCHMARK_DATASETS[dataset_name]
     total_queries = dataset_config["num_queries"]
     num_docs = dataset_config["num_docs_per_query"]
@@ -389,7 +415,7 @@ def create_benchmark_dataset_split(dataset_name: str, config: Config, train_rati
     
     for query_idx in range(total_queries):
         # Create query with domain-specific characteristics
-        query = torch.randn(1, config.seq_len, config.hidden_dim)
+        query = torch.randn(1, config.seq_len, config.hidden_dim, device=device)
         
         # Domain-specific normalization patterns
         if "Scientific" in domain:
@@ -422,7 +448,7 @@ def create_benchmark_dataset_split(dataset_name: str, config: Config, train_rati
                 doc = 0.4 * query + 0.6 * torch.randn_like(query)
                 relevance = 1
             else:  # 80% not relevant (grade 0) - realistic for retrieval
-                doc = torch.randn(1, config.seq_len, config.hidden_dim)
+                doc = torch.randn(1, config.seq_len, config.hidden_dim, device=device)
                 # Add small correlation to make it challenging but not impossible
                 if np.random.random() < 0.1:
                     doc = 0.1 * query + 0.9 * doc
@@ -608,26 +634,27 @@ def train_supervised_classification_on_dataset(model: MAWWithSupervisedClassific
             # We need to get the 5D attention weights from the model
             # For training, we'll compute them manually since we need them for supervised classification
             
-            # Get Q_depth, K_depth for 5D attention computation
-            Q_depth = model.depth_query_proj(query)  # (1, seq, hidden_dim * depth_dim)
-            K_depth = model.depth_key_proj(query)    # (1, seq, hidden_dim * depth_dim)
+            # Get Q_depth, K_depth for 5D attention computation (NEW METHOD)
+            Q_depth = model.depth_query_proj(query)  # (1, seq, num_heads * depth_dim)
+            K_depth = model.depth_key_proj(query)    # (1, seq, num_heads * depth_dim)
             
             # Reshape for 5D attention
             seq_len = query.shape[1]  # Get actual sequence length
-            Q_depth = Q_depth.view(1, seq_len, model.num_heads, model.head_dim, model.depth_dim).transpose(1, 2)
-            K_depth = K_depth.view(1, seq_len, model.num_heads, model.head_dim, model.depth_dim).transpose(1, 2)
+            Q_depth = Q_depth.view(1, seq_len, model.num_heads, model.depth_dim).transpose(1, 2)
+            # Shape: (1, num_heads, seq, depth)
+            K_depth = K_depth.view(1, seq_len, model.num_heads, model.depth_dim).transpose(1, 2)
+            # Shape: (1, num_heads, seq, depth)
             
-            # Compute 5D attention weights
-            attention_weights_5d = torch.zeros(1, model.num_heads, seq_len, seq_len, model.depth_dim,
-                                              device=device, dtype=query.dtype)
+            # NEW 5D attention computation
+            Q_depth_expanded = Q_depth.transpose(2, 3).unsqueeze(-1)  # (1, heads, depth, seq, 1)
+            K_depth_expanded = K_depth.transpose(2, 3).unsqueeze(-2)  # (1, heads, depth, 1, seq)
             
-            for depth_idx in range(model.depth_dim):
-                q_d = Q_depth[0, :, :, :, depth_idx]  # (heads, seq, head_dim)
-                k_d = K_depth[0, :, :, :, depth_idx]  # (heads, seq, head_dim)
-                
-                scores = torch.matmul(q_d, k_d.transpose(-2, -1)) / math.sqrt(model.head_dim)
-                attention_weights = F.softmax(scores, dim=-1)
-                attention_weights_5d[0, :, :, :, depth_idx] = attention_weights
+            scores_5d = Q_depth_expanded * K_depth_expanded  # (1, heads, depth, seq, seq)
+            scores_5d = scores_5d.permute(0, 1, 3, 4, 2)  # (1, heads, seq, seq, depth)
+            scores_5d = scores_5d / math.sqrt(model.depth_dim)
+            
+            attention_weights_5d = F.softmax(scores_5d, dim=-1)  # Softmax over depth dimension
+            # Shape: (1, num_heads, seq, seq, depth)
             
             # Supervised Classification router prediction based on 5D attention weights
             router_logits = model.supervised_router(attention_weights_5d)  # (1, depth_dim)
@@ -715,10 +742,136 @@ def print_dataset_results(dataset_name: str, model_results: Dict[str, Dict[str, 
             print(line)
         print("-"*100)
 
-def main():
-    """Main evaluation loop for 5 benchmark datasets"""
+def save_results_to_file(all_results: Dict, config: Dict, run_info: Dict, log_dir: str = "logs"):
+    """
+    Save benchmark results to JSON and text files with timestamp.
     
-    print("🚀 MAW vs NON-MAW Evaluation on 5 Benchmark Retrieval Datasets")
+    Args:
+        all_results: Dictionary containing all dataset results
+        config: Configuration dictionary with model/training parameters
+        run_info: Dictionary with run metadata (device, datasets, samples, etc.)
+        log_dir: Directory to save logs (default: "logs")
+    """
+    # Create logs directory if it doesn't exist
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Generate timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Prepare complete results structure
+    complete_results = {
+        "timestamp": timestamp,
+        "run_info": run_info,
+        "config": config,
+        "results": all_results
+    }
+    
+    # Save JSON (machine-readable)
+    json_path = os.path.join(log_dir, f"benchmark_supervised_{timestamp}.json")
+    with open(json_path, 'w') as f:
+        json.dump(complete_results, f, indent=2)
+    print(f"\n💾 Results saved to: {json_path}")
+    
+    # Save human-readable text summary
+    txt_path = os.path.join(log_dir, f"benchmark_supervised_{timestamp}.txt")
+    with open(txt_path, 'w') as f:
+        f.write("=" * 100 + "\n")
+        f.write("MAW vs NON-MAW Evaluation with Supervised Classification\n")
+        f.write("=" * 100 + "\n\n")
+        
+        # Run information
+        f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Device: {run_info['device']}\n")
+        f.write(f"Datasets: {', '.join(run_info['datasets'])}\n")
+        f.write(f"Samples per dataset: {run_info['samples']}\n")
+        f.write(f"Epochs: {run_info['epochs']}\n")
+        f.write(f"Train/Test Split: {run_info['train_ratio']:.0%}/{1-run_info['train_ratio']:.0%}\n")
+        f.write(f"K values: {run_info['k_values']}\n\n")
+        
+        # Configuration
+        f.write(f"Configuration:\n")
+        for key, value in config.items():
+            f.write(f"  {key}: {value}\n")
+        f.write("\n")
+        
+        # Results for each dataset
+        for dataset_name, dataset_results in all_results.items():
+            f.write("=" * 100 + "\n")
+            f.write(f"DATASET: {dataset_name}\n")
+            f.write("=" * 100 + "\n\n")
+            
+            for model_name in ['NON-MAW', 'MAW+SupervisedClassification']:
+                f.write(f"{model_name}:\n")
+                for metric_name, metric_display in [('hit_rate', 'Hit Rate'), ('mrr', 'MRR'), ('ndcg', 'NDCG')]:
+                    f.write(f"  {metric_display}:\n")
+                    for k, value in dataset_results[model_name][metric_name].items():
+                        f.write(f"    K={k}: {value:.4f}\n")
+                f.write("\n")
+        
+        f.write("=" * 100 + "\n")
+        f.write("End of Report\n")
+        f.write("=" * 100 + "\n")
+    
+    print(f"💾 Summary saved to: {txt_path}")
+    
+    return json_path, txt_path
+
+def main():
+    """Main evaluation loop for benchmark datasets"""
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description='MAW Supervised Classification Benchmark Evaluation',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run on all datasets with GPU (auto-detect)
+  python benchmark_evaluation_Supervised_Classification.py
+  
+  # Run on specific dataset with limited samples
+  python benchmark_evaluation_Supervised_Classification.py --dataset MS_MARCO --samples 20 --epochs 10
+  
+  # Force CPU usage
+  python benchmark_evaluation_Supervised_Classification.py --device cpu --samples 15
+  
+  # Run on multiple specific datasets
+  python benchmark_evaluation_Supervised_Classification.py --datasets MS_MARCO TREC_DL --samples 30
+        """
+    )
+    
+    parser.add_argument('--dataset', type=str, choices=list(BENCHMARK_DATASETS.keys()),
+                       help='Single dataset to evaluate')
+    parser.add_argument('--datasets', type=str, nargs='+', choices=list(BENCHMARK_DATASETS.keys()),
+                       help='Multiple datasets to evaluate')
+    parser.add_argument('--samples', type=int, default=None,
+                       help='Number of query samples per dataset (default: use full dataset)')
+    parser.add_argument('--epochs', type=int, default=10,
+                       help='Number of training epochs (default: 10)')
+    parser.add_argument('--device', type=str, choices=['cuda', 'cpu', 'auto'], default='auto',
+                       help='Device to use: cuda, cpu, or auto (default: auto)')
+    parser.add_argument('--train-ratio', type=float, default=0.7,
+                       help='Train/test split ratio (default: 0.7)')
+    parser.add_argument('--k-values', type=int, nargs='+', default=[1, 5, 10, 100, 1000],
+                       help='K values for metrics (default: 1 5 10 100 1000)')
+    
+    args = parser.parse_args()
+    
+    # Determine which datasets to run
+    if args.dataset:
+        datasets_to_run = [args.dataset]
+    elif args.datasets:
+        datasets_to_run = args.datasets
+    else:
+        datasets_to_run = list(BENCHMARK_DATASETS.keys())
+    
+    # Override dataset sample sizes if specified
+    original_configs = {}
+    if args.samples:
+        for dataset_name in datasets_to_run:
+            original_configs[dataset_name] = BENCHMARK_DATASETS[dataset_name]['num_queries']
+            BENCHMARK_DATASETS[dataset_name]['num_queries'] = args.samples
+    
+    print("🚀 MAW vs NON-MAW Evaluation with Supervised Classification")
     print("Used in Tier-1 Journals/Conferences: SIGIR, WWW, WSDM, CIKM, EMNLP, ACL")
     print("="*100)
     
@@ -730,47 +883,74 @@ def main():
         dropout=0.1
     )
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    k_values = [1, 5, 10, 100, 1000]
+    # Device selection with detailed info
+    if args.device == 'cuda':
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+            print(f"🎮 Device: GPU (CUDA) - {torch.cuda.get_device_name(0)}")
+            print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            print("⚠️  CUDA requested but not available, falling back to CPU")
+            device = torch.device('cpu')
+            print(f"🖥️  Device: CPU")
+    elif args.device == 'cpu':
+        device = torch.device('cpu')
+        print(f"🖥️  Device: CPU (forced)")
+    else:  # auto
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device.type == 'cuda':
+            print(f"🎮 Device: GPU (CUDA) - {torch.cuda.get_device_name(0)}")
+            print(f"   GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        else:
+            print(f"�️  Device: CPU")
     
-    print(f"📋 Configuration: hidden_dim={config.hidden_dim}, num_heads={config.num_heads}, depth_dim={config.depth_dim}")
-    print(f"🔧 Device: {device} | Evaluation metrics: Hit Rate, MRR, NDCG @ K={k_values}")
+    k_values = args.k_values
+    
+    print(f"�📋 Configuration: hidden_dim={config.hidden_dim}, num_heads={config.num_heads}, depth_dim={config.depth_dim}")
+    print(f"🔧 Training: {args.epochs} epochs | Train/Test Split: {args.train_ratio:.0%}/{1-args.train_ratio:.0%}")
+    print(f"📊 Evaluation metrics: Hit Rate, MRR, NDCG @ K={k_values}")
+    print(f"📚 Datasets to evaluate: {', '.join(datasets_to_run)}")
+    if args.samples:
+        print(f"🔢 Sample size: {args.samples} queries per dataset")
     print()
     
     # Create models
+    print(f"🔨 Creating models on {device.type.upper()}...")
     non_maw_model = NonMAWEncoder(config).to(device)
     maw_model = MAWWithSupervisedClassificationEncoder(config).to(device)
+    print(f"   ✅ NON-MAW model: {sum(p.numel() for p in non_maw_model.parameters())} parameters")
+    print(f"   ✅ MAW+SupervisedClassification model: {sum(p.numel() for p in maw_model.parameters())} parameters")
     
     # Results storage
     all_results = {}
     
-    # Loop through 5 benchmark datasets
-    for dataset_idx, dataset_name in enumerate(BENCHMARK_DATASETS.keys(), 1):
+    # Loop through selected benchmark datasets
+    for dataset_idx, dataset_name in enumerate(datasets_to_run, 1):
         print(f"\n{'='*100}")
-        print(f"DATASET {dataset_idx}/5: {BENCHMARK_DATASETS[dataset_name]['name']}")
+        print(f"DATASET {dataset_idx}/{len(datasets_to_run)}: {BENCHMARK_DATASETS[dataset_name]['name']}")
         print(f"{'='*100}")
         
         # Create dataset with proper train/test split
-        (train_queries, train_documents, train_relevance), (test_queries, test_documents, test_relevance) = create_benchmark_dataset_split(dataset_name, config, train_ratio=0.7)
-        
-        # Move to device
-        train_queries = [q.to(device) for q in train_queries]
-        train_documents = [[doc.to(device) for doc in docs] for docs in train_documents]
-        test_queries = [q.to(device) for q in test_queries]
-        test_documents = [[doc.to(device) for doc in docs] for docs in test_documents]
+        print(f"   🔧 Data creation device: {device.type.upper()}")
+        (train_queries, train_documents, train_relevance), (test_queries, test_documents, test_relevance) = create_benchmark_dataset_split(
+            dataset_name, config, train_ratio=args.train_ratio, device=device
+        )
         
         # Evaluate NON-MAW baseline (no training needed - zero-shot evaluation)
         print(f"\n🔍 Evaluating NON-MAW baseline (zero-shot on test set)...")
+        print(f"   🔧 Evaluation device: {device.type.upper()}")
         non_maw_results = evaluate_model_on_dataset(
             non_maw_model, "NON-MAW", test_queries, test_documents, test_relevance, device, k_values
         )
         
         # Train MAW+SupervisedClassification on training set
-        print(f"\n🎯 Training MAW+SupervisedClassification on training set ({len(train_queries)} queries)...")
-        train_supervised_classification_on_dataset(maw_model, train_queries, train_documents, train_relevance, device, epochs=10)
+        print(f"\n🎯 Training MAW+SupervisedClassification on training set ({len(train_queries)} queries, {args.epochs} epochs)...")
+        print(f"   🔧 Training device: {device.type.upper()}")
+        train_supervised_classification_on_dataset(maw_model, train_queries, train_documents, train_relevance, device, epochs=args.epochs)
         
         # Evaluate MAW+SupervisedClassification on test set (unseen data!)
         print(f"\n📊 Evaluating MAW+SupervisedClassification on test set ({len(test_queries)} queries)...")
+        print(f"   🔧 Evaluation device: {device.type.upper()}")
         maw_results = evaluate_model_on_dataset(
             maw_model, "MAW+SupervisedClassification", test_queries, test_documents, test_relevance, device, k_values
         )
@@ -787,44 +967,79 @@ def main():
         
         # Memory cleanup
         gc.collect()
-        if torch.cuda.is_available():
+        if device.type == 'cuda':
             torch.cuda.empty_cache()
+            print(f"\n   🧹 GPU memory cleared")
     
-    # Final summary across all datasets
-    print(f"\n{'='*100}")
-    print(f"FINAL SUMMARY: Performance Across All 5 Benchmark Datasets")
-    print(f"{'='*100}")
+    # Restore original configs if modified
+    if args.samples:
+        for dataset_name, original_size in original_configs.items():
+            BENCHMARK_DATASETS[dataset_name]['num_queries'] = original_size
     
-    # Compute average performance across datasets
-    avg_results = {'NON-MAW': {'hit_rate': {}, 'mrr': {}, 'ndcg': {}}, 
-                   'MAW+SupervisedClassification': {'hit_rate': {}, 'mrr': {}, 'ndcg': {}}}
-    
-    for k in k_values:
-        for metric in ['hit_rate', 'mrr', 'ndcg']:
-            for model in ['NON-MAW', 'MAW+SupervisedClassification']:
-                values = [all_results[dataset][model][metric][k] for dataset in BENCHMARK_DATASETS.keys()]
-                avg_results[model][metric][k] = np.mean(values)
-    
-    # Print summary table
-    print(f"\n📈 Average Performance Across All Datasets:")
-    print(f"{'Model':<15} {'Metric':<10}", end="")
-    for k in k_values:
-        print(f" @{k:<8}", end="")
-    print()
-    print("-"*100)
-    
-    for model_name in ['NON-MAW', 'MAW+SupervisedClassification']:
-        for metric_name, metric_display in [('hit_rate', 'Hit Rate'), ('mrr', 'MRR'), ('ndcg', 'NDCG')]:
-            print(f"{model_name:<15} {metric_display:<10}", end="")
-            for k in k_values:
-                value = avg_results[model_name][metric_name][k]
-                print(f" {value:<8.3f}", end="")
-            print()
+    # Final summary across all datasets (only if multiple datasets)
+    if len(datasets_to_run) > 1:
+        print(f"\n{'='*100}")
+        print(f"FINAL SUMMARY: Performance Across {len(datasets_to_run)} Benchmark Datasets")
+        print(f"{'='*100}")
+        
+        # Compute average performance across datasets
+        avg_results = {'NON-MAW': {'hit_rate': {}, 'mrr': {}, 'ndcg': {}}, 
+                       'MAW+SupervisedClassification': {'hit_rate': {}, 'mrr': {}, 'ndcg': {}}}
+        
+        for k in k_values:
+            for metric in ['hit_rate', 'mrr', 'ndcg']:
+                for model in ['NON-MAW', 'MAW+SupervisedClassification']:
+                    values = [all_results[dataset][model][metric][k] for dataset in datasets_to_run]
+                    avg_results[model][metric][k] = np.mean(values)
+        
+        # Print summary table
+        print(f"\n📈 Average Performance Across All Datasets:")
+        print(f"{'Model':<15} {'Metric':<10}", end="")
+        for k in k_values:
+            print(f" @{k:<8}", end="")
+        print()
         print("-"*100)
+        
+        for model_name in ['NON-MAW', 'MAW+SupervisedClassification']:
+            for metric_name, metric_display in [('hit_rate', 'Hit Rate'), ('mrr', 'MRR'), ('ndcg', 'NDCG')]:
+                print(f"{model_name:<15} {metric_display:<10}", end="")
+                for k in k_values:
+                    value = avg_results[model_name][metric_name][k]
+                    print(f" {value:<8.3f}", end="")
+                print()
+            print("-"*100)
+    else:
+        print(f"\n{'='*100}")
     
-    print(f"\n🎉 Evaluation completed on all 5 benchmark datasets!")
-    print(f"📊 Datasets evaluated: MS MARCO, TREC DL, Natural Questions, SciDocs, FiQA")
-    print(f"📈 Metrics computed: Hit Rate, MRR, NDCG @ K=1,5,10,100,1000")
+    print(f"\n🎉 Evaluation completed on {len(datasets_to_run)} benchmark dataset(s)!")
+    print(f"📊 Datasets evaluated: {', '.join([BENCHMARK_DATASETS[d]['name'] for d in datasets_to_run])}")
+    print(f"📈 Metrics computed: Hit Rate, MRR, NDCG @ K={k_values}")
+    print(f"🔧 Device used: {device.type.upper()}")
+    
+    # Save results to files
+    device_info = f"{device.type.upper()}"
+    if device.type == 'cuda':
+        device_info += f" - {torch.cuda.get_device_name(0)}"
+    
+    run_info = {
+        "device": device_info,
+        "datasets": datasets_to_run,
+        "samples": args.samples if args.samples else "full dataset",
+        "epochs": args.epochs,
+        "train_ratio": args.train_ratio,
+        "k_values": k_values
+    }
+    
+    config_dict = {
+        "hidden_dim": config.hidden_dim,
+        "num_heads": config.num_heads,
+        "depth_dim": config.depth_dim,
+        "seq_len": config.seq_len,
+        "vocab_size": config.vocab_size,
+        "dropout": config.dropout
+    }
+    
+    save_results_to_file(all_results, config_dict, run_info)
 
 if __name__ == "__main__":
     main()
