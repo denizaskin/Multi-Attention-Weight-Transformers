@@ -9,7 +9,7 @@ Datasets evaluated:
 4. SciDocs Citation Prediction
 5. FiQA Financial QA
 
-Metrics: Hit Rate, MRR, NDCG @ K=1,5,10,100,1000
+Metrics: Precision, Recall, MRR, NDCG, MAP @ K=1,5,10,20,100,1000
 
 Usage:
     # Run on all datasets with GPU (if available)
@@ -483,9 +483,9 @@ def create_benchmark_dataset_split(dataset_name: str, config: Config, train_rati
     return (train_queries, train_documents, train_relevance), (test_queries, test_documents, test_relevance)
 
 def compute_retrieval_metrics(similarities: torch.Tensor, relevance_scores: List[float], 
-                            k_values: List[int] = [1, 5, 10, 100, 1000]) -> Dict[str, Dict[int, float]]:
+                            k_values: List[int] = [1, 5, 10, 20, 100, 1000]) -> Dict[str, Dict[int, float]]:
     """
-    Compute Hit Rate, MRR, NDCG for specified k values
+    Compute Precision, Recall, MRR, NDCG, MAP for specified k values
     
     Args:
         similarities: (num_docs,) similarity scores
@@ -499,16 +499,39 @@ def compute_retrieval_metrics(similarities: torch.Tensor, relevance_scores: List
     sorted_indices = torch.argsort(similarities, descending=True)
     sorted_relevance = [relevance_scores[i] for i in sorted_indices.cpu().numpy()]
     
-    metrics = {'hit_rate': {}, 'mrr': {}, 'ndcg': {}}
+    metrics = {'precision': {}, 'recall': {}, 'mrr': {}, 'ndcg': {}, 'map': 0.0}
+    
+    # Count total relevant documents
+    total_relevant = sum(1 for rel in relevance_scores if rel > 0)
+    
+    # Compute MAP (Mean Average Precision) - no K cutoff
+    precisions_at_relevant = []
+    relevant_count = 0
+    for rank, rel in enumerate(sorted_relevance, 1):
+        if rel > 0:
+            relevant_count += 1
+            precision_at_rank = relevant_count / rank
+            precisions_at_relevant.append(precision_at_rank)
+    
+    if precisions_at_relevant:
+        average_precision = sum(precisions_at_relevant) / len(precisions_at_relevant)
+    else:
+        average_precision = 0.0
+    metrics['map'] = average_precision
     
     for k in k_values:
         # Ensure k doesn't exceed number of documents
         effective_k = min(k, len(sorted_relevance))
-        
-        # Hit Rate@k
         top_k_relevance = sorted_relevance[:effective_k]
-        hit_rate = 1.0 if any(rel > 0 for rel in top_k_relevance) else 0.0
-        metrics['hit_rate'][k] = hit_rate
+        
+        # Precision@k: fraction of top-K that are relevant
+        relevant_in_k = sum(1 for rel in top_k_relevance if rel > 0)
+        precision = relevant_in_k / effective_k if effective_k > 0 else 0.0
+        metrics['precision'][k] = precision
+        
+        # Recall@k: fraction of relevant docs that appear in top-K
+        recall = relevant_in_k / total_relevant if total_relevant > 0 else 0.0
+        metrics['recall'][k] = recall
         
         # MRR@k
         mrr = 0.0
@@ -538,13 +561,15 @@ def compute_retrieval_metrics(similarities: torch.Tensor, relevance_scores: List
 
 def evaluate_model_on_dataset(model: nn.Module, model_name: str, queries: List[torch.Tensor], 
                             documents: List[List[torch.Tensor]], relevance_scores: List[List[float]],
-                            device: torch.device, k_values: List[int] = [1, 5, 10, 100, 1000]) -> Dict[str, Dict[int, float]]:
+                            device: torch.device, k_values: List[int] = [1, 5, 10, 20, 100, 1000]) -> Dict[str, Dict[int, float]]:
     """Evaluate model on a single dataset"""
     
     model.eval()
-    all_metrics = {'hit_rate': {k: [] for k in k_values}, 
+    all_metrics = {'precision': {k: [] for k in k_values}, 
+                   'recall': {k: [] for k in k_values},
                    'mrr': {k: [] for k in k_values}, 
-                   'ndcg': {k: [] for k in k_values}}
+                   'ndcg': {k: [] for k in k_values},
+                   'map': []}
     
     with torch.no_grad():
         for query_idx, (query, query_docs, query_rel) in enumerate(zip(queries, documents, relevance_scores)):
@@ -569,15 +594,21 @@ def evaluate_model_on_dataset(model: nn.Module, model_name: str, queries: List[t
             
             # Accumulate metrics
             for metric_name in all_metrics:
-                for k in k_values:
-                    all_metrics[metric_name][k].append(query_metrics[metric_name][k])
+                if metric_name == 'map':
+                    all_metrics[metric_name].append(query_metrics[metric_name])
+                else:
+                    for k in k_values:
+                        all_metrics[metric_name][k].append(query_metrics[metric_name][k])
     
     # Average metrics across all queries
     avg_metrics = {}
     for metric_name in all_metrics:
-        avg_metrics[metric_name] = {}
-        for k in k_values:
-            avg_metrics[metric_name][k] = np.mean(all_metrics[metric_name][k])
+        if metric_name == 'map':
+            avg_metrics[metric_name] = np.mean(all_metrics[metric_name])
+        else:
+            avg_metrics[metric_name] = {}
+            for k in k_values:
+                avg_metrics[metric_name][k] = np.mean(all_metrics[metric_name][k])
     
     return avg_metrics
 
@@ -720,7 +751,7 @@ def train_supervised_classification_on_dataset(model: MAWWithSupervisedClassific
             print(f"  Epoch {epoch+1:2d}/{epochs}: No valid batches")
 
 def print_dataset_results(dataset_name: str, model_results: Dict[str, Dict[str, Dict[int, float]]], 
-                         k_values: List[int] = [1, 5, 10, 100, 1000],
+                         k_values: List[int] = [1, 5, 10, 20, 100, 1000],
                          train_size: int = 0, test_size: int = 0) -> None:
     """Print formatted results for a dataset with train/test split info"""
     
@@ -728,14 +759,14 @@ def print_dataset_results(dataset_name: str, model_results: Dict[str, Dict[str, 
     print(f"\n📊 {dataset_config['name']} Results")
     print(f"   Domain: {dataset_config['domain']} | Venue: {dataset_config['venue']}")
     print(f"   📈 Train: {train_size} queries | 🧪 Test: {test_size} queries (UNSEEN DATA)")
-    print("="*100)
+    print("="*120)
     
     # Header
-    header = f"{'Model':<15} {'Metric':<10}"
+    header = f"{'Model':<18} {'Metric':<10}"
     for k in k_values:
-        header += f" @{k:<8}"
+        header += f" @{k:<9}"
     print(header)
-    print("-"*100)
+    print("-"*120)
     
     # Results for each model
     for model_name in ['NON-MAW', 'MAW+SupervisedClassification']:
@@ -743,13 +774,20 @@ def print_dataset_results(dataset_name: str, model_results: Dict[str, Dict[str, 
         
         model_display = f"{model_name} (0-shot)" if model_name == 'NON-MAW' else f"{model_name} (trained)"
         
-        for metric_name, metric_display in [('hit_rate', 'Hit Rate'), ('mrr', 'MRR'), ('ndcg', 'NDCG')]:
-            line = f"{model_display:<15} {metric_display:<10}"
-            for k in k_values:
-                value = results[metric_name][k]
-                line += f" {value:<8.3f}"
+        for metric_name, metric_display in [('precision', 'Precision'), ('recall', 'Recall'), 
+                                           ('mrr', 'MRR'), ('ndcg', 'NDCG'), ('map', 'MAP')]:
+            line = f"{model_display:<18} {metric_display:<10}"
+            
+            # Handle MAP separately (no K values)
+            if metric_name == 'map':
+                line += f" {results[metric_name]:<9.3f}"
+                line += " " * (9 * (len(k_values) - 1))  # Pad remaining columns
+            else:
+                for k in k_values:
+                    value = results[metric_name][k]
+                    line += f" {value:<9.3f}"
             print(line)
-        print("-"*100)
+        print("-"*120)
 
 def save_results_to_file(all_results: Dict, config: Dict, run_info: Dict, log_dir: str = "logs"):
     """
@@ -811,10 +849,14 @@ def save_results_to_file(all_results: Dict, config: Dict, run_info: Dict, log_di
             
             for model_name in ['NON-MAW', 'MAW+SupervisedClassification']:
                 f.write(f"{model_name}:\n")
-                for metric_name, metric_display in [('hit_rate', 'Hit Rate'), ('mrr', 'MRR'), ('ndcg', 'NDCG')]:
-                    f.write(f"  {metric_display}:\n")
-                    for k, value in dataset_results[model_name][metric_name].items():
-                        f.write(f"    K={k}: {value:.4f}\n")
+                for metric_name, metric_display in [('precision', 'Precision'), ('recall', 'Recall'), 
+                                                   ('mrr', 'MRR'), ('ndcg', 'NDCG'), ('map', 'MAP')]:
+                    if metric_name == 'map':
+                        f.write(f"  {metric_display}: {dataset_results[model_name][metric_name]:.4f}\n")
+                    else:
+                        f.write(f"  {metric_display}:\n")
+                        for k, value in dataset_results[model_name][metric_name].items():
+                            f.write(f"    K={k}: {value:.4f}\n")
                 f.write("\n")
         
         f.write("=" * 100 + "\n")
@@ -860,8 +902,8 @@ Examples:
                        help='Device to use: cuda, cpu, or auto (default: auto)')
     parser.add_argument('--train-ratio', type=float, default=0.8,
                        help='Train/test split ratio (default: 0.8)')
-    parser.add_argument('--k-values', type=int, nargs='+', default=[1, 5, 10, 100, 1000],
-                       help='K values for metrics (default: 1 5 10 100 1000)')
+    parser.add_argument('--k-values', type=int, nargs='+', default=[1, 5, 10, 20, 100, 1000],
+                       help='K values for metrics (default: 1 5 10 20 100 1000)')
     
     args = parser.parse_args()
     
@@ -917,7 +959,7 @@ Examples:
     
     print(f"�📋 Configuration: hidden_dim={config.hidden_dim}, num_heads={config.num_heads}, depth_dim={config.depth_dim}")
     print(f"🔧 Training: {args.epochs} epochs | Train/Test Split: {args.train_ratio:.0%}/{1-args.train_ratio:.0%}")
-    print(f"📊 Evaluation metrics: Hit Rate, MRR, NDCG @ K={k_values}")
+    print(f"📊 Evaluation metrics: Precision, Recall, MRR, NDCG, MAP @ K={k_values}")
     print(f"📚 Datasets to evaluate: {', '.join(datasets_to_run)}")
     if args.samples:
         print(f"🔢 Sample size: {args.samples} queries per dataset")

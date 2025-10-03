@@ -9,7 +9,7 @@ Datasets evaluated:
 4. SciDocs Citation Prediction
 5. FiQA Financial QA
 
-Metrics: Hit Rate, MRR, NDCG @ K=1,5,10,100,1000
+Metrics: Precision, Recall, MRR, NDCG, MAP @ K=1,5,10,20,100,1000
 
 This version implements actual GRPO Reinforcement Learning for depth selection.
 
@@ -855,15 +855,17 @@ def train_grpo_rl_on_dataset(model: MAWWithGRPOEncoder, queries: List[torch.Tens
 def evaluate_model_on_dataset(model: nn.Module, model_name: str, 
                             queries: List[torch.Tensor], documents: List[List[torch.Tensor]], 
                             relevance_scores: List[List[float]], device: torch.device,
-                            k_values: List[int] = [1, 5, 10, 100, 1000]) -> Dict[str, Dict[int, float]]:
+                            k_values: List[int] = [1, 5, 10, 20, 100, 1000]) -> Dict[str, Dict[int, float]]:
     """Evaluate model on dataset and return metrics"""
     
     model.eval()
     
     metrics = {
-        "Hit Rate": {k: 0.0 for k in k_values},
+        "Precision": {k: 0.0 for k in k_values},
+        "Recall": {k: 0.0 for k in k_values},
         "MRR": {k: 0.0 for k in k_values}, 
-        "NDCG": {k: 0.0 for k in k_values}
+        "NDCG": {k: 0.0 for k in k_values},
+        "MAP": 0.0  # MAP is computed once per query (no K)
     }
     
     total_queries = len(queries)
@@ -892,14 +894,37 @@ def evaluate_model_on_dataset(model: nn.Module, model_name: str,
             sorted_similarities = [pair[0] for pair in doc_sim_pairs]
             sorted_relevances = [pair[1] for pair in doc_sim_pairs]
             
+            # Count total relevant documents for this query
+            total_relevant = sum(1 for rel in sorted_relevances if rel > 0.5)
+            
+            # Compute MAP (Mean Average Precision) - no K cutoff
+            precisions_at_relevant = []
+            relevant_count = 0
+            for rank, rel in enumerate(sorted_relevances, 1):
+                if rel > 0.5:
+                    relevant_count += 1
+                    precision_at_rank = relevant_count / rank
+                    precisions_at_relevant.append(precision_at_rank)
+            
+            if precisions_at_relevant:
+                average_precision = sum(precisions_at_relevant) / len(precisions_at_relevant)
+            else:
+                average_precision = 0.0
+            metrics["MAP"] += average_precision
+            
             # Compute metrics for each K
             for k in k_values:
                 k_min = min(k, len(sorted_relevances))
-                
-                # Hit Rate@K: whether any relevant document appears in top-K
                 top_k_relevances = sorted_relevances[:k_min]
-                hit_rate = 1.0 if any(rel > 0.5 for rel in top_k_relevances) else 0.0
-                metrics["Hit Rate"][k] += hit_rate
+                
+                # Precision@K: fraction of top-K that are relevant
+                relevant_in_k = sum(1 for rel in top_k_relevances if rel > 0.5)
+                precision = relevant_in_k / k_min if k_min > 0 else 0.0
+                metrics["Precision"][k] += precision
+                
+                # Recall@K: fraction of relevant docs that appear in top-K
+                recall = relevant_in_k / total_relevant if total_relevant > 0 else 0.0
+                metrics["Recall"][k] += recall
                 
                 # MRR@K: Mean Reciprocal Rank
                 mrr = 0.0
@@ -921,13 +946,16 @@ def evaluate_model_on_dataset(model: nn.Module, model_name: str,
     
     # Average metrics across all queries
     for metric_name in metrics:
-        for k in k_values:
-            metrics[metric_name][k] /= total_queries
+        if metric_name == "MAP":
+            metrics[metric_name] /= total_queries
+        else:
+            for k in k_values:
+                metrics[metric_name][k] /= total_queries
     
     return metrics
 
 def print_dataset_results(dataset_name: str, model_results: Dict[str, Dict[str, Dict[int, float]]], 
-                         k_values: List[int] = [1, 5, 10, 100, 1000],
+                         k_values: List[int] = [1, 5, 10, 20, 100, 1000],
                          train_size: int = 0, test_size: int = 0) -> None:
     """Print formatted results for a dataset with train/test split info"""
     
@@ -936,14 +964,14 @@ def print_dataset_results(dataset_name: str, model_results: Dict[str, Dict[str, 
     print(f"\n📊 {dataset_info['name']} Results")
     print(f"   Domain: {dataset_info['domain']} | Venue: {dataset_info['venue']}")
     print(f"   📈 Train: {train_size} queries | 🧪 Test: {test_size} queries (UNSEEN DATA)")
-    print("=" * 100)
+    print("=" * 120)
     
     # Header
-    header = f"{'Model':<18} {'Metric':<9}"
+    header = f"{'Model':<18} {'Metric':<10}"
     for k in k_values:
-        header += f" @{k:<8}"
+        header += f" @{k:<9}"
     print(header)
-    print("-" * 100)
+    print("-" * 120)
     
     # Results for each model
     for model_name, results in model_results.items():
@@ -957,14 +985,20 @@ def print_dataset_results(dataset_name: str, model_results: Dict[str, Dict[str, 
                 model_display = f"{model_name}{suffix}"
             else:
                 model_display = ""
-                
-            row = f"{model_display:<18} {metric_name:<9}"
-            for k in k_values:
-                value = metric_data[k]
-                row += f" {value:<8.3f}"
+            
+            row = f"{model_display:<18} {metric_name:<10}"
+            
+            # Handle MAP separately (no K values)
+            if metric_name == "MAP":
+                row += f" {metric_data:<9.3f}"
+                row += " " * (9 * (len(k_values) - 1))  # Pad remaining columns
+            else:
+                for k in k_values:
+                    value = metric_data[k]
+                    row += f" {value:<9.3f}"
             print(row)
         
-        print("-" * 100)
+        print("-" * 120)
 
 def save_results_to_file(all_results: Dict, config: Dict, run_info: Dict, log_dir: str = "logs"):
     """
@@ -1026,10 +1060,13 @@ def save_results_to_file(all_results: Dict, config: Dict, run_info: Dict, log_di
             
             for model_name in ['NON-MAW', 'MAW+GRPO_RL']:
                 f.write(f"{model_name}:\n")
-                for metric_name in ['Hit Rate', 'MRR', 'NDCG']:
-                    f.write(f"  {metric_name}:\n")
-                    for k, value in dataset_results[model_name][metric_name].items():
-                        f.write(f"    K={k}: {value:.4f}\n")
+                for metric_name in ['Precision', 'Recall', 'MRR', 'NDCG', 'MAP']:
+                    if metric_name == 'MAP':
+                        f.write(f"  {metric_name}: {dataset_results[model_name][metric_name]:.4f}\n")
+                    else:
+                        f.write(f"  {metric_name}:\n")
+                        for k, value in dataset_results[model_name][metric_name].items():
+                            f.write(f"    K={k}: {value:.4f}\n")
                 f.write("\n")
         
         f.write("=" * 100 + "\n")
@@ -1076,8 +1113,8 @@ Examples:
                        help='Device to use: cuda, cpu, or auto (default: auto)')
     parser.add_argument('--train-ratio', type=float, default=0.8,
                        help='Train/test split ratio (default: 0.8)')
-    parser.add_argument('--k-values', type=int, nargs='+', default=[1, 5, 10, 100, 1000],
-                       help='K values for metrics (default: 1 5 10 100 1000)')
+    parser.add_argument('--k-values', type=int, nargs='+', default=[1, 5, 10, 20, 100, 1000],
+                       help='K values for metrics (default: 1 5 10 20 100 1000)')
     
     args = parser.parse_args()
     
@@ -1128,7 +1165,7 @@ Examples:
     
     print(f"📋 Configuration: hidden_dim={config.hidden_dim}, num_heads={config.num_heads}, depth_dim={config.depth_dim}")
     print(f"🔧 Training: {args.epochs} epochs | Train/Test Split: {args.train_ratio:.0%}/{1-args.train_ratio:.0%}")
-    print(f"📊 Evaluation metrics: Hit Rate, MRR, NDCG @ K={k_values}")
+    print(f"📊 Evaluation metrics: Precision, Recall, MRR, NDCG, MAP @ K={k_values}")
     print(f"📚 Datasets to evaluate: {', '.join(datasets_to_run)}")
     if args.samples:
         print(f"🔢 Sample size: {args.samples} queries per dataset")
