@@ -42,6 +42,18 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+def set_random_seed(seed: int = 42):
+    """Set random seed for reproducibility across all libraries"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # Make CUDA operations deterministic (may impact performance)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 @dataclass
 class Config:
     hidden_dim: int = 256
@@ -373,7 +385,8 @@ class MAWWithSupervisedClassificationEncoder(nn.Module):
         
         return output
 
-def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.8, device: torch.device = None) -> Tuple[
+def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.8, 
+                                  device: torch.device = None, seed: int = 42) -> Tuple[
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]],  # train
     Tuple[List[torch.Tensor], List[List[torch.Tensor]], List[List[float]]]   # test
 ]:
@@ -385,6 +398,7 @@ def create_benchmark_dataset_split(dataset_name: str, config: Config, train_rati
         config: Model configuration
         train_ratio: Ratio for training split (default 0.8)
         device: Device to create tensors on (if None, uses CUDA if available)
+        seed: Random seed for reproducible splits (default: 42)
         
     Returns:
         (train_queries, train_docs, train_relevance), (test_queries, test_docs, test_relevance)
@@ -462,13 +476,19 @@ def create_benchmark_dataset_split(dataset_name: str, config: Config, train_rati
         all_documents.append(query_docs)
         all_relevance_scores.append(query_relevance)
     
-    # Split into train/test with shuffling (same approach as GRPO for consistency)
+    # Split into train/test with reproducible shuffling
     train_size = int(total_queries * train_ratio)
     indices = list(range(total_queries))
-    random.shuffle(indices)
+    
+    # Set seed for reproducible split
+    rng = random.Random(seed)
+    rng.shuffle(indices)
     
     train_indices = indices[:train_size]
     test_indices = indices[train_size:]
+    
+    print(f"   🎲 Split seed: {seed} (for reproducibility)")
+    print(f"   📊 Train indices: {train_indices[:5]}... | Test indices: {test_indices[:5]}...")
     
     # Create train split
     train_queries = [all_queries[i] for i in train_indices]
@@ -904,8 +924,14 @@ Examples:
                        help='Train/test split ratio (default: 0.8)')
     parser.add_argument('--k-values', type=int, nargs='+', default=[1, 5, 10, 20, 100, 1000],
                        help='K values for metrics (default: 1 5 10 20 100 1000)')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed for reproducibility (default: 42)')
     
     args = parser.parse_args()
+    
+    # Set random seed for reproducibility
+    set_random_seed(args.seed)
+    print(f"🎲 Random seed: {args.seed} (for reproducible results)")
     
     # Determine which datasets to run
     if args.dataset:
@@ -984,7 +1010,7 @@ Examples:
         # Create dataset with proper train/test split
         print(f"   🔧 Data creation device: {device.type.upper()}")
         (train_queries, train_documents, train_relevance), (test_queries, test_documents, test_relevance) = create_benchmark_dataset_split(
-            dataset_name, config, train_ratio=args.train_ratio, device=device
+            dataset_name, config, train_ratio=args.train_ratio, device=device, seed=args.seed
         )
         
         # Evaluate NON-MAW baseline (no training needed - zero-shot evaluation)
