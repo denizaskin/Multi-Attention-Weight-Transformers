@@ -63,8 +63,28 @@ class Config:
     seq_len: int = 128
     vocab_size: int = 30000
     dropout: float = 0.1
+    num_layers: int = 1  # Number of transformer layers
+    maw_layers: List[int] = None  # Which layers use MAW (None = all layers)
     use_half_precision: bool = False  # Disabled for compatibility
     enable_gradient_checkpointing: bool = False
+    
+    def __post_init__(self):
+        """Process maw_layers configuration"""
+        if self.maw_layers is None:
+            # Default: apply MAW to all layers
+            self.maw_layers = list(range(1, self.num_layers + 1))
+        elif isinstance(self.maw_layers, str):
+            # Handle special notation like "1:-1" (all layers)
+            if self.maw_layers == "1:-1" or self.maw_layers == "all":
+                self.maw_layers = list(range(1, self.num_layers + 1))
+            else:
+                raise ValueError(f"Invalid maw_layers string: {self.maw_layers}")
+        else:
+            # Validate layer indices
+            self.maw_layers = [int(x) for x in self.maw_layers]
+            for layer_idx in self.maw_layers:
+                if layer_idx < 1 or layer_idx > self.num_layers:
+                    raise ValueError(f"Layer index {layer_idx} out of range [1, {self.num_layers}]")
     
     @property
     def depth_dim(self) -> int:
@@ -495,12 +515,11 @@ class GRPORouter(nn.Module):
         
         return total_loss
 
-class NonMAWEncoder(nn.Module):
-    """Standard multi-head attention encoder (NON-MAW baseline)"""
+class StandardAttentionLayer(nn.Module):
+    """Single standard multi-head attention layer (non-MAW)"""
     
     def __init__(self, config: Config):
         super().__init__()
-        self.config = config
         self.hidden_dim = config.hidden_dim
         self.num_heads = config.num_heads
         self.head_dim = config.hidden_dim // config.num_heads
@@ -514,15 +533,6 @@ class NonMAWEncoder(nn.Module):
         self.layer_norm = nn.LayerNorm(self.hidden_dim)
         self.dropout = nn.Dropout(config.dropout)
         
-        self._initialize_weights()
-        
-    def _initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-    
     def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         batch_size, seq_len, _ = hidden_states.shape
         
@@ -554,33 +564,18 @@ class NonMAWEncoder(nn.Module):
         
         return output
 
-class MAWWithGRPOEncoder(nn.Module):
-    """Multi-Attention-Weight encoder with 5D attention and GRPO RL router"""
+class NonMAWEncoder(nn.Module):
+    """Standard multi-head attention encoder with multiple layers (NON-MAW baseline)"""
     
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.hidden_dim = config.hidden_dim
-        self.num_heads = config.num_heads
-        self.head_dim = config.hidden_dim // config.num_heads
-        self.depth_dim = config.depth_dim
+        self.num_layers = config.num_layers
         
-        # Standard projections for 3D attention
-        self.query_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.key_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        self.value_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
-        
-        # Depth-aware projections for 5D attention (new method: projects to num_heads * depth_dim)
-        self.depth_query_proj = nn.Linear(self.hidden_dim, self.num_heads * self.depth_dim, bias=False)
-        self.depth_key_proj = nn.Linear(self.hidden_dim, self.num_heads * self.depth_dim, bias=False)
-        
-        # GRPO RL Router
-        self.grpo_router = GRPORouter(config)
-        
-        # Output layers
-        self.out_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.layer_norm = nn.LayerNorm(self.hidden_dim)
-        self.dropout = nn.Dropout(config.dropout)
+        # Create stack of standard attention layers
+        self.layers = nn.ModuleList([
+            StandardAttentionLayer(config) for _ in range(self.num_layers)
+        ])
         
         self._initialize_weights()
         
@@ -592,6 +587,39 @@ class MAWWithGRPOEncoder(nn.Module):
                     nn.init.zeros_(module.bias)
     
     def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        # Pass through each layer sequentially
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask)
+        return hidden_states
+
+class MAWAttentionLayer(nn.Module):
+    """Single MAW attention layer with 5D attention and GRPO RL router"""
+    
+    def __init__(self, config: Config):
+        super().__init__()
+        self.hidden_dim = config.hidden_dim
+        self.num_heads = config.num_heads
+        self.head_dim = config.hidden_dim // config.num_heads
+        self.depth_dim = config.depth_dim
+        
+        # Standard projections for 3D attention
+        self.query_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.key_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        self.value_proj = nn.Linear(self.hidden_dim, self.hidden_dim, bias=False)
+        
+        # Depth-aware projections for 5D attention
+        self.depth_query_proj = nn.Linear(self.hidden_dim, self.num_heads * self.depth_dim, bias=False)
+        self.depth_key_proj = nn.Linear(self.hidden_dim, self.num_heads * self.depth_dim, bias=False)
+        
+        # GRPO RL Router (shared across MAW layers)
+        self.grpo_router = None  # Will be set externally
+        
+        # Output layers
+        self.out_proj = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.layer_norm = nn.LayerNorm(self.hidden_dim)
+        self.dropout = nn.Dropout(config.dropout)
+    
+    def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
         batch_size, seq_len, _ = hidden_states.shape
         
         # Standard Q, K, V projections
@@ -599,68 +627,85 @@ class MAWWithGRPOEncoder(nn.Module):
         K = self.key_proj(hidden_states)
         V = self.value_proj(hidden_states)
         
-        # Depth-aware projections for 5D attention
-        Q_depth = self.depth_query_proj(hidden_states)
-        K_depth = self.depth_key_proj(hidden_states)
-        
-        # Reshape Q, K, V for multi-head attention
+        # Reshape for multi-head attention
         Q = Q.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # NEW 5D ATTENTION COMPUTATION METHOD:
-        # Reshape depth projections: (batch, seq, heads*depth) -> (batch, heads, seq, depth)
+        # Depth-aware projections
+        Q_depth = self.depth_query_proj(hidden_states)
+        K_depth = self.depth_key_proj(hidden_states)
+        
         Q_depth = Q_depth.view(batch_size, seq_len, self.num_heads, self.depth_dim).transpose(1, 2)
-        # Shape: (batch_size, num_heads, sequence_length_query, depth)
-        
         K_depth = K_depth.view(batch_size, seq_len, self.num_heads, self.depth_dim).transpose(1, 2)
-        # Shape: (batch_size, num_heads, sequence_length_key, depth)
         
-        # Step 2: Expand Q_depth and transpose
-        # (batch, heads, seq_q, depth) -> (batch, heads, depth, seq_q, 1)
+        # NEW 5D attention computation
         Q_depth_expanded = Q_depth.transpose(2, 3).unsqueeze(-1)
-        
-        # Step 3: Expand K_depth (already transposed)
-        # (batch, heads, seq_k, depth) -> (batch, heads, depth, 1, seq_k)
         K_depth_expanded = K_depth.transpose(2, 3).unsqueeze(-2)
         
-        # Step 4: Element-wise multiply with broadcasting
-        # (batch, heads, depth, seq_q, 1) * (batch, heads, depth, 1, seq_k)
-        # = (batch, heads, depth, seq_q, seq_k)
         scores_5d = Q_depth_expanded * K_depth_expanded
-        
-        # Transpose to (batch, heads, seq_q, seq_k, depth)
         scores_5d = scores_5d.permute(0, 1, 3, 4, 2)
-        
-        # Step 5: Scale by sqrt(depth) and apply softmax
         scores_5d = scores_5d / math.sqrt(self.depth_dim)
         
-        # Apply attention mask if provided
         if attention_mask is not None:
-            mask = attention_mask.unsqueeze(1).unsqueeze(1).unsqueeze(-1)  # (batch, 1, 1, seq, 1)
+            mask = attention_mask.unsqueeze(1).unsqueeze(1).unsqueeze(-1)
             mask = mask.expand(batch_size, self.num_heads, seq_len, seq_len, self.depth_dim)
             scores_5d = scores_5d.masked_fill(mask == 0, -1e9)
         
-        # Softmax over depth dimension (dim=-1)
         attention_weights_5d = F.softmax(scores_5d, dim=-1)
-        # Shape: (batch_size, num_heads, sequence_length_query, sequence_length_key, depth)
         
-        # GRPO RL: Select optimal 4D attention weights from 5D attention weights
-        # Input: (batch, heads, seq_q, seq_k, depth) -> Output: (batch, heads, seq_q, seq_k)
+        # GRPO RL: Select optimal 4D attention weights from 5D
         selected_attention_weights = self.grpo_router.select_optimal_attention(attention_weights_5d)
-        
-        # Apply dropout to selected attention weights
         selected_attention_weights = self.dropout(selected_attention_weights)
         
-        # Apply selected attention weights to values
-        context = torch.matmul(selected_attention_weights, V)  # (batch, heads, seq, head_dim)
+        # Apply attention to values
+        context = torch.matmul(selected_attention_weights, V)
         context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_dim)
         
-        # Output projection and residual connection
+        # Output projection and residual
         output = self.out_proj(context)
         output = self.layer_norm(output + hidden_states)
         
         return output
+
+class MAWWithGRPOEncoder(nn.Module):
+    """Multi-Attention-Weight encoder with 5D attention and GRPO RL router - supports selective MAW layers"""
+    
+    def __init__(self, config: Config):
+        super().__init__()
+        self.config = config
+        self.num_layers = config.num_layers
+        self.maw_layers = config.maw_layers
+        
+        # Shared GRPO RL Router for all MAW layers
+        self.grpo_router = GRPORouter(config)
+        
+        # Create stack of layers (mix of MAW and standard based on config)
+        self.layers = nn.ModuleList()
+        for layer_idx in range(1, self.num_layers + 1):
+            if layer_idx in self.maw_layers:
+                # Use MAW attention for this layer
+                maw_layer = MAWAttentionLayer(config)
+                maw_layer.grpo_router = self.grpo_router  # Share GRPO router
+                self.layers.append(maw_layer)
+            else:
+                # Use standard attention for this layer
+                self.layers.append(StandardAttentionLayer(config))
+        
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, hidden_states: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        # Pass through each layer sequentially
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, attention_mask)
+        return hidden_states
 
 def create_benchmark_dataset_split(dataset_name: str, config: Config, train_ratio: float = 0.8, 
                                   device: torch.device = None, seed: int = 42) -> Tuple[
@@ -809,18 +854,30 @@ def train_grpo_rl_on_dataset(model: MAWWithGRPOEncoder, queries: List[torch.Tens
                     sim_baseline = F.cosine_similarity(query_repr_baseline, doc_repr_baseline, dim=-1)
                     baseline_scores.append(sim_baseline.item())
             
-            # Get 5D attention weights from MAW model (NEW METHOD)
-            # We need to extract them from the forward pass
+            # Get 5D attention weights from MAW model
+            # Find first MAW layer to extract attention weights
+            maw_layer = None
+            for layer in model.layers:
+                if isinstance(layer, MAWAttentionLayer):
+                    maw_layer = layer
+                    break
+            
+            if maw_layer is None:
+                raise ValueError("No MAW layers found in model - cannot train GRPO")
+            
             with torch.no_grad():
-                # Get Q_depth, K_depth for 5D attention computation
-                Q_depth = model.depth_query_proj(query)  # (1, seq, num_heads * depth_dim)
-                K_depth = model.depth_key_proj(query)    # (1, seq, num_heads * depth_dim)
+                # Get Q_depth, K_depth for 5D attention computation from first MAW layer
+                Q_depth = maw_layer.depth_query_proj(query)  # (1, seq, num_heads * depth_dim)
+                K_depth = maw_layer.depth_key_proj(query)    # (1, seq, num_heads * depth_dim)
                 
                 # Reshape for 5D attention
                 seq_len = query.shape[1]
-                Q_depth = Q_depth.view(1, seq_len, model.num_heads, model.depth_dim).transpose(1, 2)
+                num_heads = maw_layer.num_heads
+                depth_dim = maw_layer.depth_dim
+                
+                Q_depth = Q_depth.view(1, seq_len, num_heads, depth_dim).transpose(1, 2)
                 # Shape: (1, num_heads, seq, depth)
-                K_depth = K_depth.view(1, seq_len, model.num_heads, model.depth_dim).transpose(1, 2)
+                K_depth = K_depth.view(1, seq_len, num_heads, depth_dim).transpose(1, 2)
                 # Shape: (1, num_heads, seq, depth)
                 
                 # NEW 5D attention computation
@@ -829,7 +886,7 @@ def train_grpo_rl_on_dataset(model: MAWWithGRPOEncoder, queries: List[torch.Tens
                 
                 scores_5d = Q_depth_expanded * K_depth_expanded  # (1, heads, depth, seq, seq)
                 scores_5d = scores_5d.permute(0, 1, 3, 4, 2)  # (1, heads, seq, seq, depth)
-                scores_5d = scores_5d / math.sqrt(model.depth_dim)
+                scores_5d = scores_5d / math.sqrt(depth_dim)
                 
                 attention_weights_5d = F.softmax(scores_5d, dim=-1)  # Softmax over depth dimension
                 # Shape: (1, num_heads, seq, seq, depth)
@@ -1137,6 +1194,10 @@ Examples:
                        help='K values for metrics (default: 1 5 10 20 100 1000)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed for reproducibility (default: 42)')
+    parser.add_argument('--num-layers', type=int, default=1,
+                       help='Number of transformer layers (default: 1)')
+    parser.add_argument('--maw-layers', type=str, default='all',
+                       help='Which layers use MAW: comma-separated list (e.g., "1,3,5"), "all", or "none" (default: all)')
     
     args = parser.parse_args()
     
@@ -1163,8 +1224,17 @@ Examples:
     print("Used in Tier-1 Journals/Conferences: SIGIR, WWW, WSDM, CIKM, EMNLP, ACL")
     print("=" * 100)
     
+    # Parse MAW layers configuration
+    if args.maw_layers.lower() == 'all':
+        maw_layers_list = None  # Will be set to all layers in Config
+    elif args.maw_layers.lower() == 'none':
+        maw_layers_list = []
+    else:
+        # Parse comma-separated list
+        maw_layers_list = [int(x.strip()) for x in args.maw_layers.split(',')]
+    
     # Configuration
-    config = Config()
+    config = Config(num_layers=args.num_layers, maw_layers=maw_layers_list)
     
     # Device selection with detailed info
     if args.device == 'cuda':
@@ -1190,6 +1260,7 @@ Examples:
     k_values = args.k_values
     
     print(f"📋 Configuration: hidden_dim={config.hidden_dim}, num_heads={config.num_heads}, depth_dim={config.depth_dim}")
+    print(f"🏗️  Architecture: {config.num_layers} layer(s) | MAW enabled on layers: {config.maw_layers}")
     print(f"🔧 Training: {args.epochs} epochs | Train/Test Split: {args.train_ratio:.0%}/{1-args.train_ratio:.0%}")
     print(f"📊 Evaluation metrics: Precision, Recall, MRR, NDCG, MAP @ K={k_values}")
     print(f"📚 Datasets to evaluate: {', '.join(datasets_to_run)}")
