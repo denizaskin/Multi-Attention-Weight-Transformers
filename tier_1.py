@@ -1435,8 +1435,14 @@ def run_complete_benchmark(config: Tier1Config):
         if dataset_results['supervised']:
             supervised_metrics = dataset_results['supervised']['metrics']
             metrics_str = ' | '.join([f"{supervised_metrics.get(m, 0.0):.4f}" for m in dataset_info['metrics']])
-            improvement = supervised_metrics.get('nDCG@10', 0) - zeroshot_results.get('nDCG@10', 0)
-            print(f"{'Supervised Fine-tuned':<30} {'|':^5} {metrics_str}  (Δ nDCG@10: {improvement:+.4f})")
+            # Calculate improvement for primary metric (first in list)
+            primary_metric = dataset_info['metrics'][0]
+            if primary_metric in zeroshot_results and primary_metric in supervised_metrics:
+                abs_improvement = supervised_metrics[primary_metric] - zeroshot_results[primary_metric]
+                rel_improvement = (abs_improvement / zeroshot_results[primary_metric] * 100) if zeroshot_results[primary_metric] > 0 else 0
+                print(f"{'Supervised Fine-tuned':<30} {'|':^5} {metrics_str}  (Δ {primary_metric}: {abs_improvement:+.4f} / {rel_improvement:+.2f}%)")
+            else:
+                print(f"{'Supervised Fine-tuned':<30} {'|':^5} {metrics_str}")
         else:
             print(f"{'Supervised Fine-tuned':<30} {'|':^5} N/A (No training data)")
         
@@ -1444,12 +1450,102 @@ def run_complete_benchmark(config: Tier1Config):
         if dataset_results['maw']:
             maw_metrics = dataset_results['maw']['metrics']
             metrics_str = ' | '.join([f"{maw_metrics.get(m, 0.0):.4f}" for m in dataset_info['metrics']])
-            improvement = maw_metrics.get('nDCG@10', 0) - zeroshot_results.get('nDCG@10', 0)
-            print(f"{'MAW Fine-tuned':<30} {'|':^5} {metrics_str}  (Δ nDCG@10: {improvement:+.4f})")
+            # Calculate improvement vs zero-shot and vs supervised
+            primary_metric = dataset_info['metrics'][0]
+            if primary_metric in zeroshot_results and primary_metric in maw_metrics:
+                abs_improvement = maw_metrics[primary_metric] - zeroshot_results[primary_metric]
+                rel_improvement = (abs_improvement / zeroshot_results[primary_metric] * 100) if zeroshot_results[primary_metric] > 0 else 0
+                print(f"{'MAW Fine-tuned':<30} {'|':^5} {metrics_str}  (Δ {primary_metric}: {abs_improvement:+.4f} / {rel_improvement:+.2f}%)")
+            else:
+                print(f"{'MAW Fine-tuned':<30} {'|':^5} {metrics_str}")
+            
+            # Show MAW vs Supervised comparison
+            if dataset_results['supervised'] and primary_metric in supervised_metrics and primary_metric in maw_metrics:
+                abs_improvement_vs_sup = maw_metrics[primary_metric] - supervised_metrics[primary_metric]
+                rel_improvement_vs_sup = (abs_improvement_vs_sup / supervised_metrics[primary_metric] * 100) if supervised_metrics[primary_metric] > 0 else 0
+                print(f"{'  → MAW vs Supervised':<30} {'':^5} {'':<50}  (Δ {primary_metric}: {abs_improvement_vs_sup:+.4f} / {rel_improvement_vs_sup:+.2f}%)")
         else:
             print(f"{'MAW Fine-tuned':<30} {'|':^5} N/A (No training data)")
         
         print(f"{'='*100}\n")
+        
+        # ==============================================================================
+        # SAVE PER-DATASET JSON FILE
+        # ==============================================================================
+        
+        log_dir = Path(config.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create per-dataset JSON with clear structure
+        dataset_json = {
+            'dataset_name': dataset_name,
+            'dataset_type': dataset_type,
+            'venue': dataset_venue,
+            'evaluated_at': datetime.now().isoformat(),
+            'configuration': {
+                'seed': config.seed,
+                'num_layers': config.num_layers,
+                'maw_layers': config.maw_layers,
+                'num_epochs': config.num_epochs,
+                'batch_size': config.batch_size,
+                'learning_rate': config.learning_rate,
+                'train_samples': config.train_samples,
+                'val_samples': config.val_samples,
+                'test_samples': config.test_samples,
+            },
+            'results': {
+                '1_normal_retriever': {
+                    'approach': 'Zero-shot (No Training)',
+                    'description': 'Off-the-shelf retriever without any fine-tuning',
+                    'metrics': zeroshot_results
+                },
+                '2_lora_supervised_retriever': {
+                    'approach': 'LoRA Supervised Fine-tuned',
+                    'description': 'Baseline retriever with LoRA fine-tuning on supervised data',
+                    'metrics': dataset_results['supervised']['metrics'] if dataset_results['supervised'] else None,
+                    'training_history': dataset_results['supervised']['training_history'] if dataset_results['supervised'] else None
+                },
+                '3_maw_supervised_retriever': {
+                    'approach': 'MAW Fine-tuned (GRPO on last layer)',
+                    'description': 'MAW retriever with selective layer fine-tuning and GRPO attention',
+                    'metrics': dataset_results['maw']['metrics'] if dataset_results['maw'] else None,
+                    'training_history': dataset_results['maw']['training_history'] if dataset_results['maw'] else None
+                }
+            },
+            'improvements': {}
+        }
+        
+        # Calculate improvements
+        if dataset_results['supervised']:
+            supervised_metrics = dataset_results['supervised']['metrics']
+            for metric in dataset_info['metrics']:
+                if metric in zeroshot_results and metric in supervised_metrics:
+                    dataset_json['improvements'][f'supervised_vs_zeroshot_{metric}'] = {
+                        'absolute': supervised_metrics[metric] - zeroshot_results[metric],
+                        'relative_pct': ((supervised_metrics[metric] - zeroshot_results[metric]) / zeroshot_results[metric] * 100) if zeroshot_results[metric] > 0 else 0
+                    }
+        
+        if dataset_results['maw']:
+            maw_metrics = dataset_results['maw']['metrics']
+            for metric in dataset_info['metrics']:
+                if metric in zeroshot_results and metric in maw_metrics:
+                    dataset_json['improvements'][f'maw_vs_zeroshot_{metric}'] = {
+                        'absolute': maw_metrics[metric] - zeroshot_results[metric],
+                        'relative_pct': ((maw_metrics[metric] - zeroshot_results[metric]) / zeroshot_results[metric] * 100) if zeroshot_results[metric] > 0 else 0
+                    }
+                if dataset_results['supervised'] and metric in supervised_metrics and metric in maw_metrics:
+                    dataset_json['improvements'][f'maw_vs_supervised_{metric}'] = {
+                        'absolute': maw_metrics[metric] - supervised_metrics[metric],
+                        'relative_pct': ((maw_metrics[metric] - supervised_metrics[metric]) / supervised_metrics[metric] * 100) if supervised_metrics[metric] > 0 else 0
+                    }
+        
+        # Save per-dataset JSON file
+        dataset_filename = dataset_name.lower().replace(' ', '_').replace('-', '_')
+        dataset_json_path = log_dir / f"{dataset_filename}_results.json"
+        with open(dataset_json_path, 'w') as f:
+            json.dump(dataset_json, f, indent=2)
+        
+        print(f"💾 Saved dataset results: {dataset_json_path}\n")
         
         all_results['datasets'][dataset_name] = {
             'dataset_info': dataset_info,
@@ -1493,28 +1589,76 @@ def run_complete_benchmark(config: Tier1Config):
             results = dataset_data['results']
             metrics = dataset_data['dataset_info']['metrics']
             
-            for approach in ['zeroshot', 'supervised', 'maw']:
-                if results[approach] is None:
-                    f.write(f"{approach.upper()}: N/A\n\n")
-                    continue
-                
-                if approach == 'zeroshot':
-                    approach_results = results[approach]
-                else:
-                    approach_results = results[approach]['metrics']
-                
-                f.write(f"{approach.upper()}:\n")
+            # 1. Zero-shot results
+            if results['zeroshot']:
+                f.write("1. NORMAL RETRIEVER (Zero-shot - No Training):\n")
                 for metric in metrics:
-                    if metric in approach_results:
-                        f.write(f"  {metric}: {approach_results[metric]:.4f}\n")
+                    if metric in results['zeroshot']:
+                        f.write(f"  {metric}: {results['zeroshot'][metric]:.4f}\n")
                 f.write("\n")
+            else:
+                f.write("1. NORMAL RETRIEVER: N/A\n\n")
+            
+            # 2. Supervised results
+            if results['supervised']:
+                supervised_metrics = results['supervised']['metrics']
+                f.write("2. LORA SUPERVISED RETRIEVER (LoRA Fine-tuned):\n")
+                for metric in metrics:
+                    if metric in supervised_metrics:
+                        f.write(f"  {metric}: {supervised_metrics[metric]:.4f}")
+                        # Add improvement vs zero-shot
+                        if results['zeroshot'] and metric in results['zeroshot']:
+                            abs_imp = supervised_metrics[metric] - results['zeroshot'][metric]
+                            rel_imp = (abs_imp / results['zeroshot'][metric] * 100) if results['zeroshot'][metric] > 0 else 0
+                            f.write(f"  (vs zero-shot: {abs_imp:+.4f} / {rel_imp:+.2f}%)")
+                        f.write("\n")
+                f.write("\n")
+            else:
+                f.write("2. LORA SUPERVISED RETRIEVER: N/A (No training data)\n\n")
+            
+            # 3. MAW results
+            if results['maw']:
+                maw_metrics = results['maw']['metrics']
+                f.write("3. MAW SUPERVISED RETRIEVER (GRPO on last layer):\n")
+                for metric in metrics:
+                    if metric in maw_metrics:
+                        f.write(f"  {metric}: {maw_metrics[metric]:.4f}")
+                        # Add improvement vs zero-shot
+                        if results['zeroshot'] and metric in results['zeroshot']:
+                            abs_imp = maw_metrics[metric] - results['zeroshot'][metric]
+                            rel_imp = (abs_imp / results['zeroshot'][metric] * 100) if results['zeroshot'][metric] > 0 else 0
+                            f.write(f"  (vs zero-shot: {abs_imp:+.4f} / {rel_imp:+.2f}%)")
+                        f.write("\n")
+                f.write("\n")
+                
+                # Key comparison: MAW vs Supervised
+                if results['supervised']:
+                    f.write("KEY COMPARISON - MAW vs Supervised Baseline:\n")
+                    supervised_metrics = results['supervised']['metrics']
+                    for metric in metrics:
+                        if metric in maw_metrics and metric in supervised_metrics:
+                            abs_imp = maw_metrics[metric] - supervised_metrics[metric]
+                            rel_imp = (abs_imp / supervised_metrics[metric] * 100) if supervised_metrics[metric] > 0 else 0
+                            f.write(f"  {metric}: {abs_imp:+.4f} absolute / {rel_imp:+.2f}% relative\n")
+                    f.write("\n")
+            else:
+                f.write("3. MAW SUPERVISED RETRIEVER: N/A (No training data)\n\n")
     
     print(f"\n{'='*100}")
     print(f"{'BENCHMARK COMPLETE':^100}")
     print(f"{'='*100}\n")
     print(f"Results saved:")
-    print(f"  JSON: {json_path}")
-    print(f"  TXT:  {txt_path}")
+    print(f"  Complete JSON: {json_path}")
+    print(f"  Summary TXT:   {txt_path}")
+    print(f"\n  Per-Dataset JSON files in: {log_dir}/")
+    for dataset_info in [
+        {'name': 'MS MARCO', 'type': 'msmarco'},
+        {'name': 'BEIR SciDocs', 'type': 'beir_scidocs'},
+        {'name': 'BEIR SciFact', 'type': 'beir_scifact'},
+        {'name': 'LoTTE Science', 'type': 'lotte_science'},
+    ]:
+        dataset_filename = dataset_info['name'].lower().replace(' ', '_').replace('-', '_')
+        print(f"    - {dataset_filename}_results.json")
     print(f"\n{'='*100}\n")
     
     return all_results
