@@ -7,6 +7,9 @@ peft==0.9.0
 numpy==1.26.4
 scipy==1.12.0
 scikit-learn==1.4.2
+sentence-transformers==2.7.0
+beir==2.0.0
+pytrec-eval==0.5
 
 # Experimental and Statistical Analysis
 matplotlib==3.8.0
