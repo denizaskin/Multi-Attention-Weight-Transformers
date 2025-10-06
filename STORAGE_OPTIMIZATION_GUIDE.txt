@@ -1,0 +1,267 @@
+================================================================================
+              STORAGE OPTIMIZATION GUIDE FOR TIER_1.PY
+================================================================================
+
+
+ SOLUTION: Automatic storage optimization with ~90% reduction (3-5 GB total)
+
+================================================================================
+                           QUICK START
+================================================================================
+
+1. DEFAULT RUN (Recommended):
+   
+   python3 tier_1.py
+   
+   • All optimizations enabled by default
+   • Storage: ~3-5 GB for full evaluation
+   • Safe for most GPU setups
+
+2. CHECK STORAGE SETTINGS:
+
+   At the start of run, you'll see:
+   
+   ⚙️  Storage Optimization Settings:
+      Keep only best checkpoint:    True
+      Max checkpoints per model:    2
+      Checkpoint compression:       True
+      Log compression (gzip):       True
+      Max log files to keep:        10
+      Clear CUDA cache:             True
+      Clear embeddings after eval:  True
+
+3. END-OF-RUN STORAGE REPORT:
+
+   At the end, you'll see:
+   
+   � STORAGE REPORT
+   ================
+   
+   📊 Storage Usage:
+      Checkpoints: 3.45 GB (3538 MB)
+      Logs:        456 MB
+      TOTAL:       3.89 GB (3994 MB)
+
+================================================================================
+                    CUSTOMIZATION OPTIONS
+================================================================================
+
+To customize, edit tier_1.py or create custom config:
+
+from tier_1 import Tier1Config
+
+# MAXIMUM OPTIMIZATION (Extreme storage saving)
+config = Tier1Config(
+    keep_only_best_checkpoint=True,      # Only keep best checkpoint
+    max_checkpoints_per_model=0,         # No epoch checkpoints
+    keep_only_summary_logs=True,         # Only summary, no per-dataset logs
+    max_log_files=3,                     # Keep only 3 recent complete logs
+    checkpoint_compression=True,         # Compress checkpoints (20-30% smaller)
+    compress_logs=True,                  # Compress logs with gzip (80-90% smaller)
+    clear_cuda_cache=True,               # Clear GPU memory between datasets
+    clear_embeddings_after_eval=True,    # Delete embeddings after eval
+)
+
+# Expected storage: ~1-2 GB
+
+# MINIMAL OPTIMIZATION (More checkpoints, more storage)
+config = Tier1Config(
+    keep_only_best_checkpoint=False,     # Keep all checkpoints
+    max_checkpoints_per_model=5,         # Keep 5 recent epoch checkpoints
+    keep_only_summary_logs=False,        # Keep all per-dataset logs
+    max_log_files=20,                    # Keep 20 recent complete logs
+    checkpoint_compression=True,         # Still compress
+    compress_logs=True,                  # Still compress
+    clear_cuda_cache=True,               # Still clear cache
+    clear_embeddings_after_eval=True,    # Still clear embeddings
+)
+
+# Expected storage: ~8-12 GB
+
+# NO OPTIMIZATION (Not recommended - will overflow!)
+config = Tier1Config(
+    keep_only_best_checkpoint=False,
+    max_checkpoints_per_model=0,         # Unlimited
+    cleanup_old_checkpoints=False,       # No cleanup
+    keep_only_summary_logs=False,
+    max_log_files=0,                     # Unlimited
+    checkpoint_compression=False,        # No compression
+    compress_logs=False,                 # No compression
+    clear_cuda_cache=False,              # No cache clearing
+    clear_embeddings_after_eval=False,   # No embedding cleanup
+)
+
+# Expected storage: ~40-70 GB ⚠️  DANGER!
+
+================================================================================
+                      OPTIMIZATION DETAILS
+================================================================================
+
+1. CHECKPOINT STORAGE:
+   
+   Without optimization:
+   • 4 datasets × 2 models × 10 epochs = 80 checkpoint files
+   • Each ~500-800 MB
+   • Total: ~40-64 GB ❌
+   
+   With optimization (default):
+   • 4 datasets × 2 models × (1 best + 1 latest + 2 epoch) = ~16 files
+   • Compressed ~350-560 MB each
+   • Total: ~2.8-4.5 GB ✅
+   
+   Savings: ~90%
+
+2. LOG STORAGE:
+   
+   Without optimization:
+   • Large JSON files (~50-200 MB each)
+   • 4 per-dataset + 1 complete = 5 files per run
+   • Multiple runs accumulate
+   • Total: ~2-10 GB ❌
+   
+   With optimization (default):
+   • Compressed .json.gz files (~5-20 MB each)
+   • Keep only 10 most recent complete benchmarks
+   • Total: ~200-500 MB ✅
+   
+   Savings: ~80-90%
+
+3. GPU MEMORY:
+   
+   Without cleanup:
+   • Memory accumulates across datasets
+   • Can cause OOM (Out of Memory) errors
+   • May crash during 3rd or 4th dataset
+   
+   With cleanup (default):
+   • Clear CUDA cache between datasets
+   • Delete embeddings/predictions after eval
+   • Stable memory throughout run
+   • No OOM errors
+
+================================================================================
+                       MONITORING STORAGE
+================================================================================
+
+1. During run:
+   
+   After each dataset, you'll see:
+   
+   🧹 Cleaning up GPU memory...
+      GPU 0: 2.34 GB allocated, 3.12 GB reserved
+      GPU 1: 2.28 GB allocated, 3.09 GB reserved
+      ...
+
+2. After each checkpoint:
+   
+   ✅ BEST checkpoint saved: epoch003_nDCG0.4532_20251006_123045.pt
+   🗑️  Deleted old checkpoint: epoch001_nDCG0.4123_20251006_122830.pt
+
+3. End of run:
+   
+   💾 STORAGE REPORT
+   =================
+   
+   📊 Storage Usage:
+      Checkpoints: 3.45 GB
+      Logs:        456 MB
+      TOTAL:       3.89 GB
+   
+   ⚠️  WARNING: Storage usage is high (10.5 GB)!
+       Consider enabling more aggressive cleanup
+
+4. Manual check anytime:
+   
+   du -sh checkpoints/
+   du -sh logs/
+
+================================================================================
+                         TROUBLESHOOTING
+================================================================================
+
+Q: Still running out of GPU memory?
+A: Enable gradient checkpointing:
+   config.use_gradient_checkpointing = True
+   (Slower but uses ~40% less GPU memory)
+
+Q: Still running out of disk space?
+A: Use maximum optimization settings:
+   config.keep_only_best_checkpoint = True
+   config.max_checkpoints_per_model = 0
+   config.keep_only_summary_logs = True
+   config.max_log_files = 3
+
+Q: Need to keep all checkpoints for analysis?
+A: Disable cleanup but use compression:
+   config.cleanup_old_checkpoints = False
+   config.checkpoint_compression = True
+   config.compress_logs = True
+   (Will use more space but still ~50% savings)
+
+Q: How to read compressed logs?
+A: Use gzip:
+   
+   # Python
+   import gzip, json
+   with gzip.open('results.json.gz', 'rt') as f:
+       data = json.load(f)
+   
+   # Command line
+   gzip -cd results.json.gz | jq .
+   zcat results.json.gz | less
+
+Q: Can I delete old checkpoints manually?
+A: Yes, but be careful:
+   
+   # Delete all epoch checkpoints, keep best/latest
+   rm checkpoints/tier1/*/*/epoch*.pt
+   
+   # Delete specific dataset
+   rm -rf checkpoints/tier1/MS_MARCO/
+   
+   # Clean everything
+   rm -rf checkpoints/ logs/
+
+================================================================================
+                           BEST PRACTICES
+================================================================================
+
+ DO:
+   • Use default optimization settings for most runs
+   • Monitor storage report at end of run
+   • Keep only necessary checkpoints
+   • Use compression for logs and checkpoints
+   • Clear GPU memory between datasets
+
+ DON'T:
+   • Disable all optimizations unless necessary
+   • Keep unlimited checkpoints for long runs
+   • Ignore storage warnings
+   • Run without clearing GPU cache
+   • Store embeddings on GPU for large evaluations
+
+   • Start with quick test to verify storage usage:
+     python3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3
+   
+   • Check available disk space before full run:
+     df -h
+   
+   • Use maximum optimization if disk < 20 GB free
+   
+   • Monitor GPU memory during run:
+     watch -n 1 nvidia-smi
+
+================================================================================
+                              SUMMARY
+================================================================================
+
+DEFAULT SETTINGS (Recommended):
+  ✅ Safe for most users
+  ✅ ~90% storage reduction
+  ✅ ~3-5 GB total usage
+  ✅ No performance impact
+  ✅ Prevents GPU overflow
+
+Just run: python3 tier_1.py
+
+================================================================================

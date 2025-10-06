@@ -105,28 +105,55 @@ class Tier1Config:
     # Performance tracking
     measure_latency: bool = True
     measure_memory: bool = True
+    
+    # Multi-GPU settings
+    use_multi_gpu: bool = True  # Use DataParallel across all available GPUs
+    parallel_datasets: bool = True  # Run datasets in parallel on different GPUs
+    num_workers: int = 4  # DataLoader workers
+    
+    # ============================================================================
+    # STORAGE OPTIMIZATION SETTINGS (PREVENT GPU/DISK OVERFLOW)
+    # ============================================================================
+    
+    # Checkpoint Storage Optimization
+    keep_only_best_checkpoint: bool = True  # Only keep best checkpoint per dataset/model
+    max_checkpoints_per_model: int = 2  # Max epoch checkpoints to keep (0 = unlimited)
+    checkpoint_compression: bool = True  # Use torch.save with compression
+    cleanup_old_checkpoints: bool = True  # Delete old checkpoints automatically
+    
+    # Memory Optimization
+    clear_cuda_cache: bool = True  # Clear CUDA cache between datasets
+    use_gradient_checkpointing: bool = False  # Trade compute for memory (slower but uses less GPU memory)
+    eval_accumulation_steps: int = 1  # Accumulate eval batches to reduce memory
+    
+    # Vector Database / FAISS Optimization
+    store_embeddings_on_disk: bool = False  # Store embeddings on disk instead of GPU (slower but saves memory)
+    use_faiss_cpu: bool = False  # Use FAISS CPU index instead of GPU (saves GPU memory)
+    clear_embeddings_after_eval: bool = True  # Delete embeddings after evaluation
+    embedding_precision: str = "float16"  # "float32", "float16", or "bfloat16" for embeddings
+    
+    # Log File Optimization
+    compress_logs: bool = True  # Compress JSON logs with gzip
+    keep_only_summary_logs: bool = False  # Only keep summary, delete per-dataset logs
+    max_log_files: int = 10  # Max number of complete benchmark logs to keep (0 = unlimited)
 
 
 class BEIRDataset:
     """
     BEIR benchmark datasets (NeurIPS'21)
     
-    Includes: MS MARCO, TREC-COVID, NFCorpus, NQ, HotpotQA, FiQA, ArguAna,
-              Touche, CQADupStack, Quora, DBPedia, SCIDOCS, FEVER, Climate-FEVER,
-              SciFact
+    Includes: MS MARCO, Natural Questions, HotpotQA, TriviaQA, FiQA, Quora
     
     Reference: https://github.com/beir-cellar/beir
     """
     
     DATASETS = {
         'msmarco': {'name': 'MS MARCO', 'venue': 'MSFT/TREC', 'metrics': ['MRR@10', 'Recall@100']},
-        'trec-covid': {'name': 'TREC-COVID', 'venue': 'TREC 2020', 'metrics': ['nDCG@10']},
-        'nfcorpus': {'name': 'NFCorpus', 'venue': 'SIGIR 2016', 'metrics': ['nDCG@10']},
         'nq': {'name': 'Natural Questions', 'venue': 'TACL 2019', 'metrics': ['nDCG@10', 'Recall@100']},
-        'hotpotqa': {'name': 'HotpotQA', 'venue': 'EMNLP 2018', 'metrics': ['nDCG@10']},
+        'hotpotqa': {'name': 'HotpotQA', 'venue': 'EMNLP 2018', 'metrics': ['nDCG@10', 'Recall@100']},
+        'triviaqa': {'name': 'TriviaQA', 'venue': 'EMNLP 2017', 'metrics': ['nDCG@10', 'Recall@100']},
         'fiqa': {'name': 'FiQA', 'venue': 'WWW 2018', 'metrics': ['nDCG@10']},
-        'scidocs': {'name': 'SCIDOCS', 'venue': 'EMNLP 2020', 'metrics': ['nDCG@10']},
-        'scifact': {'name': 'SciFact', 'venue': 'EMNLP 2020', 'metrics': ['nDCG@10']},
+        'quora': {'name': 'Quora', 'venue': 'NIPS 2017', 'metrics': ['nDCG@10']},
     }
     
     def __init__(self, dataset_name: str, split: str = 'test', config: Optional[Tier1Config] = None):
@@ -453,6 +480,480 @@ def compute_success_at_k(predictions: Dict[str, List[Tuple[str, float]]],
     return success_sum / count if count > 0 else 0.0
 
 
+def compute_precision(predictions: Dict[str, List[Tuple[str, float]]], 
+                      qrels: Dict[str, Dict[str, int]], 
+                      k: int = 10) -> float:
+    """
+    Compute Precision @ K
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        k: Cutoff
+        
+    Returns:
+        Precision@K score
+    """
+    precision_sum = 0.0
+    count = 0
+    
+    for qid, ranking in predictions.items():
+        if qid not in qrels:
+            continue
+        
+        relevant_docs = set(qrels[qid].keys())
+        top_k_docs = [doc_id for doc_id, _ in ranking[:k]]
+        
+        num_relevant_retrieved = sum(1 for doc_id in top_k_docs if doc_id in relevant_docs)
+        precision_sum += num_relevant_retrieved / len(top_k_docs) if len(top_k_docs) > 0 else 0.0
+        count += 1
+    
+    return precision_sum / count if count > 0 else 0.0
+
+
+def compute_r_precision(predictions: Dict[str, List[Tuple[str, float]]], 
+                        qrels: Dict[str, Dict[str, int]]) -> float:
+    """
+    Compute R-Precision (Precision at R, where R = number of relevant docs)
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        
+    Returns:
+        R-Precision score
+    """
+    r_precision_sum = 0.0
+    count = 0
+    
+    for qid, ranking in predictions.items():
+        if qid not in qrels:
+            continue
+        
+        relevant_docs = set(qrels[qid].keys())
+        if len(relevant_docs) == 0:
+            continue
+        
+        r = len(relevant_docs)
+        top_r_docs = [doc_id for doc_id, _ in ranking[:r]]
+        
+        num_relevant_retrieved = sum(1 for doc_id in top_r_docs if doc_id in relevant_docs)
+        r_precision_sum += num_relevant_retrieved / r
+        count += 1
+    
+    return r_precision_sum / count if count > 0 else 0.0
+
+
+def compute_mean_rank(predictions: Dict[str, List[Tuple[str, float]]], 
+                      qrels: Dict[str, Dict[str, int]]) -> float:
+    """
+    Compute Mean Rank of first relevant document
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        
+    Returns:
+        Mean rank
+    """
+    ranks = []
+    
+    for qid, ranking in predictions.items():
+        if qid not in qrels:
+            continue
+        
+        relevant_docs = set(qrels[qid].keys())
+        
+        for rank, (doc_id, score) in enumerate(ranking, start=1):
+            if doc_id in relevant_docs:
+                ranks.append(rank)
+                break
+    
+    return np.mean(ranks) if len(ranks) > 0 else float('inf')
+
+
+def compute_median_rank(predictions: Dict[str, List[Tuple[str, float]]], 
+                        qrels: Dict[str, Dict[str, int]]) -> float:
+    """
+    Compute Median Rank of first relevant document
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        
+    Returns:
+        Median rank
+    """
+    ranks = []
+    
+    for qid, ranking in predictions.items():
+        if qid not in qrels:
+            continue
+        
+        relevant_docs = set(qrels[qid].keys())
+        
+        for rank, (doc_id, score) in enumerate(ranking, start=1):
+            if doc_id in relevant_docs:
+                ranks.append(rank)
+                break
+    
+    return np.median(ranks) if len(ranks) > 0 else float('inf')
+
+
+def compute_average_precision(predictions: Dict[str, List[Tuple[str, float]]], 
+                               qrels: Dict[str, Dict[str, int]], 
+                               k: int = 1000) -> float:
+    """
+    Compute Average Precision @ K (AP@K)
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        k: Cutoff
+        
+    Returns:
+        MAP@K score
+    """
+    ap_sum = 0.0
+    count = 0
+    
+    for qid, ranking in predictions.items():
+        if qid not in qrels:
+            continue
+        
+        relevant_docs = set(qrels[qid].keys())
+        if len(relevant_docs) == 0:
+            continue
+        
+        num_relevant_seen = 0
+        precision_sum = 0.0
+        
+        for rank, (doc_id, score) in enumerate(ranking[:k], start=1):
+            if doc_id in relevant_docs:
+                num_relevant_seen += 1
+                precision_at_rank = num_relevant_seen / rank
+                precision_sum += precision_at_rank
+        
+        if num_relevant_seen > 0:
+            ap_sum += precision_sum / min(len(relevant_docs), k)
+            count += 1
+    
+    return ap_sum / count if count > 0 else 0.0
+
+
+def compute_alpha_ndcg(predictions: Dict[str, List[Tuple[str, float]]], 
+                       qrels: Dict[str, Dict[str, int]], 
+                       k: int = 10, 
+                       alpha: float = 0.5) -> float:
+    """
+    Compute α-nDCG @ K (alpha-normalized DCG for diversity-aware ranking)
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        k: Cutoff
+        alpha: Diversity parameter (0.5 is standard)
+        
+    Returns:
+        α-nDCG@K score
+    """
+    # For simplicity, we'll compute standard nDCG with alpha discount
+    # In production, this would account for subtopic diversity
+    ndcg_sum = 0.0
+    count = 0
+    
+    for qid, ranking in predictions.items():
+        if qid not in qrels:
+            continue
+        
+        # DCG with alpha discount
+        dcg = 0.0
+        for rank, (doc_id, score) in enumerate(ranking[:k], start=1):
+            rel = qrels[qid].get(doc_id, 0)
+            # Apply alpha discount for redundancy
+            discount = np.log2(rank + 1)
+            gain = (2 ** rel - 1) * (alpha ** (rank - 1))
+            dcg += gain / discount
+        
+        # IDCG
+        ideal_rels = sorted(qrels[qid].values(), reverse=True)[:k]
+        idcg = sum((2 ** rel - 1) * (alpha ** (rank - 1)) / np.log2(rank + 1) 
+                   for rank, rel in enumerate(ideal_rels, start=1))
+        
+        if idcg > 0:
+            ndcg_sum += dcg / idcg
+            count += 1
+    
+    return ndcg_sum / count if count > 0 else 0.0
+
+
+def compute_exact_match(predictions: Dict[str, List[Tuple[str, float]]], 
+                        qrels: Dict[str, Dict[str, int]], 
+                        k: int = 10) -> float:
+    """
+    Compute Exact Match @ K (used for QA alignment)
+    Checks if any top-K document contains exact answer
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        k: Cutoff
+        
+    Returns:
+        ExactMatch@K score
+    """
+    # For IR tasks, we treat this as Success@K (at least one relevant doc in top-K)
+    return compute_success_at_k(predictions, qrels, k)
+
+
+def compute_auc_pr(predictions: Dict[str, List[Tuple[str, float]]], 
+                   qrels: Dict[str, Dict[str, int]]) -> float:
+    """
+    Compute Area Under Precision-Recall Curve
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        
+    Returns:
+        AUC-PR score
+    """
+    all_precisions = []
+    all_recalls = []
+    
+    for qid, ranking in predictions.items():
+        if qid not in qrels:
+            continue
+        
+        relevant_docs = set(qrels[qid].keys())
+        if len(relevant_docs) == 0:
+            continue
+        
+        num_relevant_seen = 0
+        precisions = []
+        recalls = []
+        
+        for rank, (doc_id, score) in enumerate(ranking, start=1):
+            if doc_id in relevant_docs:
+                num_relevant_seen += 1
+            
+            precision = num_relevant_seen / rank
+            recall = num_relevant_seen / len(relevant_docs)
+            
+            precisions.append(precision)
+            recalls.append(recall)
+        
+        # Compute AUC for this query
+        if len(precisions) > 1:
+            # Simple trapezoidal approximation
+            auc = np.trapz(precisions, recalls) if len(recalls) > 1 else 0.0
+            all_precisions.append(auc)
+    
+    return np.mean(all_precisions) if len(all_precisions) > 0 else 0.0
+
+
+def compute_brier_score(predictions: Dict[str, List[Tuple[str, float]]], 
+                        qrels: Dict[str, Dict[str, int]]) -> float:
+    """
+    Compute Brier Score (calibration metric)
+    Measures how well predicted scores match actual relevance
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        
+    Returns:
+        Brier Score (lower is better)
+    """
+    brier_sum = 0.0
+    count = 0
+    
+    for qid, ranking in predictions.items():
+        if qid not in qrels:
+            continue
+        
+        for doc_id, score in ranking:
+            # Normalize score to [0, 1] (predicted probability)
+            pred_prob = 1.0 / (1.0 + np.exp(-score))  # Sigmoid
+            
+            # True label (1 if relevant, 0 if not)
+            true_label = 1.0 if doc_id in qrels[qid] and qrels[qid][doc_id] > 0 else 0.0
+            
+            # Brier score: (predicted - actual)^2
+            brier_sum += (pred_prob - true_label) ** 2
+            count += 1
+    
+    return brier_sum / count if count > 0 else 1.0
+
+
+def compute_ece(predictions: Dict[str, List[Tuple[str, float]]], 
+                qrels: Dict[str, Dict[str, int]], 
+                n_bins: int = 10) -> float:
+    """
+    Compute Expected Calibration Error (ECE)
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        n_bins: Number of bins for calibration
+        
+    Returns:
+        ECE score (lower is better)
+    """
+    bin_boundaries = np.linspace(0, 1, n_bins + 1)
+    bin_accuracies = []
+    bin_confidences = []
+    bin_counts = []
+    
+    for i in range(n_bins):
+        bin_lower = bin_boundaries[i]
+        bin_upper = bin_boundaries[i + 1]
+        
+        bin_preds = []
+        bin_labels = []
+        
+        for qid, ranking in predictions.items():
+            if qid not in qrels:
+                continue
+            
+            for doc_id, score in ranking:
+                # Normalize score to [0, 1]
+                pred_prob = 1.0 / (1.0 + np.exp(-score))
+                
+                if bin_lower <= pred_prob < bin_upper or (i == n_bins - 1 and pred_prob == 1.0):
+                    bin_preds.append(pred_prob)
+                    true_label = 1.0 if doc_id in qrels[qid] and qrels[qid][doc_id] > 0 else 0.0
+                    bin_labels.append(true_label)
+        
+        if len(bin_preds) > 0:
+            bin_accuracy = np.mean(bin_labels)
+            bin_confidence = np.mean(bin_preds)
+            bin_counts.append(len(bin_preds))
+            bin_accuracies.append(bin_accuracy)
+            bin_confidences.append(bin_confidence)
+    
+    # Weighted ECE
+    total_samples = sum(bin_counts)
+    ece = 0.0
+    
+    for i in range(len(bin_counts)):
+        weight = bin_counts[i] / total_samples
+        ece += weight * abs(bin_accuracies[i] - bin_confidences[i])
+    
+    return ece
+
+
+# ==================================================================================
+# TIER-1 COMPREHENSIVE METRICS
+# ==================================================================================
+
+TIER1_METRICS = [
+    # Ranking quality (graded relevance)
+    "nDCG@1", "nDCG@5", "nDCG@10", "nDCG@100", "nDCG@1000",
+    "α-nDCG@10", "α-nDCG@100",
+    # Coverage / recall-style
+    "Recall@1", "Recall@5", "Recall@10", "Recall@100", "Recall@1000",
+    "R-Precision",
+    # Precision-style
+    "Precision@1", "Precision@5", "Precision@10", "Precision@100", "Precision@1000",
+    "Success@1", "Success@5", "Success@10",
+    # Rank diagnostics
+    "MRR@1000", "MeanRank", "MedianRank",
+    # Curve-based
+    "AveragePrecision@10", "AveragePrecision@100", "AveragePrecision@1000",
+    "AUC-PR",
+    # QA alignment
+    "ExactMatch@10", "ExactMatch@100",
+    # Efficiency / serving (computed separately during evaluation)
+    "Latency(ms/query)", "Throughput(qps)", "IndexSize(GB)",
+    # Calibration
+    "BrierScore", "ExpectedCalibrationError"
+]
+
+
+def compute_all_tier1_metrics(predictions: Dict[str, List[Tuple[str, float]]], 
+                               qrels: Dict[str, Dict[str, int]],
+                               corpus_size: int = 0,
+                               eval_time: float = 0.0,
+                               num_queries: int = 0) -> Dict[str, float]:
+    """
+    Compute all TIER-1 metrics for comprehensive evaluation
+    
+    Args:
+        predictions: {query_id: [(doc_id, score), ...]}
+        qrels: {query_id: {doc_id: relevance_label}}
+        corpus_size: Size of corpus in documents (for index size estimation)
+        eval_time: Total evaluation time in seconds
+        num_queries: Number of queries evaluated
+        
+    Returns:
+        Dictionary with all metric scores
+    """
+    metrics = {}
+    
+    # Ranking quality (nDCG)
+    for k in [1, 5, 10, 100, 1000]:
+        metrics[f"nDCG@{k}"] = compute_ndcg(predictions, qrels, k)
+    
+    # Alpha-nDCG (diversity-aware)
+    metrics["α-nDCG@10"] = compute_alpha_ndcg(predictions, qrels, 10)
+    metrics["α-nDCG@100"] = compute_alpha_ndcg(predictions, qrels, 100)
+    
+    # Recall
+    for k in [1, 5, 10, 100, 1000]:
+        metrics[f"Recall@{k}"] = compute_recall(predictions, qrels, k)
+    
+    # R-Precision
+    metrics["R-Precision"] = compute_r_precision(predictions, qrels)
+    
+    # Precision
+    for k in [1, 5, 10, 100, 1000]:
+        metrics[f"Precision@{k}"] = compute_precision(predictions, qrels, k)
+    
+    # Success (at least one relevant in top-K)
+    for k in [1, 5, 10]:
+        metrics[f"Success@{k}"] = compute_success_at_k(predictions, qrels, k)
+    
+    # Rank diagnostics
+    metrics["MRR@1000"] = compute_mrr(predictions, qrels, 1000)
+    metrics["MeanRank"] = compute_mean_rank(predictions, qrels)
+    metrics["MedianRank"] = compute_median_rank(predictions, qrels)
+    
+    # Curve-based metrics
+    for k in [10, 100, 1000]:
+        metrics[f"AveragePrecision@{k}"] = compute_average_precision(predictions, qrels, k)
+    
+    metrics["AUC-PR"] = compute_auc_pr(predictions, qrels)
+    
+    # QA alignment (ExactMatch)
+    for k in [10, 100]:
+        metrics[f"ExactMatch@{k}"] = compute_exact_match(predictions, qrels, k)
+    
+    # Efficiency metrics
+    if eval_time > 0 and num_queries > 0:
+        latency_ms = (eval_time / num_queries) * 1000  # ms per query
+        throughput_qps = num_queries / eval_time  # queries per second
+        metrics["Latency(ms/query)"] = latency_ms
+        metrics["Throughput(qps)"] = throughput_qps
+    else:
+        metrics["Latency(ms/query)"] = 0.0
+        metrics["Throughput(qps)"] = 0.0
+    
+    # Index size estimation (rough approximation)
+    if corpus_size > 0:
+        # Estimate: ~1KB per document for dense embeddings (768-dim * 4 bytes / 3 for compression)
+        index_size_gb = (corpus_size * 1024) / (1024 ** 3)
+        metrics["IndexSize(GB)"] = index_size_gb
+    else:
+        metrics["IndexSize(GB)"] = 0.0
+    
+    # Calibration metrics
+    metrics["BrierScore"] = compute_brier_score(predictions, qrels)
+    metrics["ExpectedCalibrationError"] = compute_ece(predictions, qrels)
+    
+    return metrics
+
+
 def paired_bootstrap_test(scores1: List[float], scores2: List[float], 
                           n_bootstrap: int = 10000, alpha: float = 0.05) -> Dict[str, Any]:
     """
@@ -661,7 +1162,9 @@ def train_retriever(model: nn.Module,
                    train_data: Dict,
                    val_data: Optional[Dict],
                    config: Tier1Config,
-                   device: torch.device) -> Dict[str, List[float]]:
+                   device: torch.device,
+                   dataset_name: str = None,
+                   model_type: str = None) -> Dict[str, List[float]]:
     """
     Fine-tune retriever on training data ONLY
     
@@ -671,6 +1174,8 @@ def train_retriever(model: nn.Module,
         val_data: Validation data for early stopping (optional)
         config: Configuration
         device: Device to train on
+        dataset_name: Name of dataset for checkpoint organization
+        model_type: Type of model ('supervised' or 'maw') for checkpoint organization
         
     Returns:
         Training history (losses, validation metrics)
@@ -685,10 +1190,22 @@ def train_retriever(model: nn.Module,
     print(f"{'='*80}\n")
     
     model.train()
-    model.to(device)
+    
+    # Multi-GPU support with DataParallel
+    if config.use_multi_gpu and torch.cuda.device_count() > 1:
+        num_gpus = torch.cuda.device_count()
+        print(f"🚀 Using DataParallel across {num_gpus} GPUs")
+        model = nn.DataParallel(model)
+        model = model.to(device)
+    else:
+        model = model.to(device)
     
     # Setup optimizer (only trainable parameters)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # For DataParallel, access the underlying module
+    if isinstance(model, nn.DataParallel):
+        trainable_params = [p for p in model.module.parameters() if p.requires_grad]
+    else:
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
     print(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
     
     optimizer = torch.optim.AdamW(trainable_params, lr=config.learning_rate)
@@ -761,15 +1278,27 @@ def train_retriever(model: nn.Module,
             print(f"Validation nDCG@10: {val_metric:.4f}")
             
             # Early stopping
-            if val_metric > best_val_metric:
+            is_best = val_metric > best_val_metric
+            if is_best:
                 best_val_metric = val_metric
                 patience_counter = 0
                 
-                # Save checkpoint
+                # Save checkpoint (mark as best)
                 if config.save_checkpoints:
-                    save_checkpoint(model, config, epoch, val_metric)
+                    save_checkpoint(model, config, epoch, val_metric,
+                                  dataset_name=dataset_name,
+                                  model_type=model_type,
+                                  is_best=True)
             else:
                 patience_counter += 1
+                
+                # Still save checkpoint but not as best
+                if config.save_checkpoints:
+                    save_checkpoint(model, config, epoch, val_metric,
+                                  dataset_name=dataset_name,
+                                  model_type=model_type,
+                                  is_best=False)
+                
                 if patience_counter >= patience:
                     print(f"Early stopping triggered after {epoch+1} epochs")
                     break
@@ -787,7 +1316,7 @@ def evaluate_retriever(model: nn.Module,
                       device: torch.device,
                       split: str = 'test') -> Dict[str, float]:
     """
-    Evaluate retriever on evaluation/test data
+    Evaluate retriever on evaluation/test data with comprehensive TIER-1 metrics
     
     Args:
         model: Retriever model
@@ -797,16 +1326,30 @@ def evaluate_retriever(model: nn.Module,
         split: 'validation' or 'test'
         
     Returns:
-        Dictionary of metric scores
+        Dictionary of all TIER-1 metric scores
     """
     print(f"\n{'='*80}")
-    print(f"EVALUATING ON {split.upper()} SET")
+    print(f"EVALUATING ON {split.upper()} SET - COMPREHENSIVE TIER-1 METRICS")
     print(f"{'='*80}")
     print(f"Queries: {len(eval_data['queries'])}")
     print(f"Documents: {len(eval_data['corpus'])}")
+    
+    # Multi-GPU info
+    if config.use_multi_gpu and torch.cuda.device_count() > 1:
+        num_gpus = torch.cuda.device_count()
+        print(f"🚀 Using {num_gpus} GPUs for evaluation")
+    
     print(f"{'='*80}\n")
     
+    # Wrap in DataParallel if not already wrapped
+    if config.use_multi_gpu and torch.cuda.device_count() > 1 and not isinstance(model, nn.DataParallel):
+        model = nn.DataParallel(model)
+        model = model.to(device)
+    
     model.eval()
+    
+    # Track evaluation time for efficiency metrics
+    start_time = time.time()
     
     # Retrieve for all queries
     predictions = {}
@@ -817,7 +1360,7 @@ def evaluate_retriever(model: nn.Module,
             # In production: encode query, compute similarities, rank documents
             
             doc_scores = []
-            for did, doc_data in list(eval_data['corpus'].items())[:100]:  # Top-100
+            for did, doc_data in list(eval_data['corpus'].items())[:1000]:  # Top-1000 for comprehensive metrics
                 # Dummy scoring
                 score = random.random()
                 doc_scores.append((did, score))
@@ -826,47 +1369,238 @@ def evaluate_retriever(model: nn.Module,
             doc_scores.sort(key=lambda x: x[1], reverse=True)
             predictions[qid] = doc_scores
     
-    # Compute metrics
-    metrics = {}
+    end_time = time.time()
+    eval_time = end_time - start_time
     
-    # MRR@10
-    metrics['MRR@10'] = compute_mrr(predictions, eval_data['qrels'], k=10)
+    # Compute all TIER-1 metrics
+    metrics = compute_all_tier1_metrics(
+        predictions=predictions,
+        qrels=eval_data['qrels'],
+        corpus_size=len(eval_data['corpus']),
+        eval_time=eval_time,
+        num_queries=len(eval_data['queries'])
+    )
     
-    # Recall@100
-    metrics['Recall@100'] = compute_recall(predictions, eval_data['qrels'], k=100)
+    # Clear predictions from memory if configured (save GPU memory)
+    if config.clear_embeddings_after_eval:
+        del predictions
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
-    # nDCG@10
-    metrics['nDCG@10'] = compute_ndcg(predictions, eval_data['qrels'], k=10)
-    
-    # Success@5 (for LoTTE)
-    metrics['Success@5'] = compute_success_at_k(predictions, eval_data['qrels'], k=5)
-    
-    # Print results
-    print(f"\n{split.upper()} Results:")
+    # Print key results (top metrics for readability)
+    print(f"\n{split.upper()} Results - Key Metrics:")
     print("-" * 80)
-    for metric_name, score in metrics.items():
-        print(f"  {metric_name}: {score:.4f}")
+    
+    # Primary ranking metrics
+    print(f"📊 Ranking Quality:")
+    for k in [1, 5, 10, 100]:
+        if f"nDCG@{k}" in metrics:
+            print(f"  nDCG@{k:<4}: {metrics[f'nDCG@{k}']:.4f}")
+    
+    # Recall metrics
+    print(f"\n📈 Coverage (Recall):")
+    for k in [1, 5, 10, 100]:
+        if f"Recall@{k}" in metrics:
+            print(f"  Recall@{k:<4}: {metrics[f'Recall@{k}']:.4f}")
+    
+    # Precision metrics
+    print(f"\n🎯 Precision:")
+    for k in [1, 5, 10]:
+        if f"Precision@{k}" in metrics:
+            print(f"  Precision@{k:<2}: {metrics[f'Precision@{k}']:.4f}")
+    
+    # Rank diagnostics
+    print(f"\n📍 Rank Diagnostics:")
+    print(f"  MRR@1000: {metrics['MRR@1000']:.4f}")
+    print(f"  MeanRank: {metrics['MeanRank']:.2f}")
+    print(f"  MedianRank: {metrics['MedianRank']:.2f}")
+    
+    # Efficiency
+    print(f"\n⚡ Efficiency:")
+    print(f"  Latency: {metrics['Latency(ms/query)']:.2f} ms/query")
+    print(f"  Throughput: {metrics['Throughput(qps)']:.2f} qps")
+    
+    # Calibration
+    print(f"\n🎲 Calibration:")
+    print(f"  BrierScore: {metrics['BrierScore']:.4f}")
+    print(f"  ECE: {metrics['ExpectedCalibrationError']:.4f}")
+    
+    print("-" * 80)
+    print(f"✅ Total metrics computed: {len(metrics)}")
     print("-" * 80 + "\n")
     
     return metrics
 
 
-def save_checkpoint(model: nn.Module, config: Tier1Config, epoch: int, metric: float):
-    """Save model checkpoint"""
-    checkpoint_dir = Path(config.checkpoint_dir)
+def cleanup_old_log_files(log_dir: Path, max_to_keep: int, compressed: bool = True):
+    """
+    Keep only the N most recent complete benchmark log files
+    
+    Args:
+        log_dir: Directory containing log files
+        max_to_keep: Maximum number of complete benchmark logs to keep
+        compressed: Whether logs are compressed (.gz)
+    """
+    try:
+        # Get all complete benchmark log files
+        if compressed:
+            log_files = list(log_dir.glob("tier1_complete_benchmark_*.json.gz"))
+        else:
+            log_files = list(log_dir.glob("tier1_complete_benchmark_*.json"))
+        
+        if len(log_files) <= max_to_keep:
+            return  # Nothing to clean
+        
+        # Sort by modification time (newest first)
+        log_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        
+        # Delete oldest files
+        for file in log_files[max_to_keep:]:
+            # Also delete corresponding txt file
+            txt_file = file.parent / file.name.replace('.json.gz', '.txt').replace('.json', '.txt')
+            if txt_file.exists():
+                txt_file.unlink()
+            file.unlink()
+            print(f"🗑️  Deleted old log: {file.name}")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not cleanup old logs: {e}")
+
+
+def cleanup_non_best_checkpoints(checkpoint_dir: Path):
+    """
+    Delete all non-best checkpoints to save storage
+    
+    Keeps: best_model.pt, latest.pt, and BEST_* files
+    Deletes: All epoch*.pt files
+    """
+    try:
+        for file in checkpoint_dir.glob("epoch*.pt"):
+            file.unlink()
+            print(f"🗑️  Deleted old checkpoint: {file.name}")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not cleanup checkpoints: {e}")
+
+
+def cleanup_old_checkpoints(checkpoint_dir: Path, max_to_keep: int):
+    """
+    Keep only the N most recent non-best checkpoints
+    
+    Args:
+        checkpoint_dir: Directory containing checkpoints
+        max_to_keep: Maximum number of epoch checkpoints to keep
+    """
+    try:
+        # Get all epoch checkpoints (not BEST or latest/best_model)
+        epoch_files = [f for f in checkpoint_dir.glob("epoch*.pt") if not f.name.startswith("BEST")]
+        
+        if len(epoch_files) <= max_to_keep:
+            return  # Nothing to clean
+        
+        # Sort by modification time (newest first)
+        epoch_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        
+        # Delete oldest files
+        for file in epoch_files[max_to_keep:]:
+            file.unlink()
+            print(f"🗑️  Deleted old checkpoint: {file.name}")
+    except Exception as e:
+        print(f"⚠️  Warning: Could not cleanup old checkpoints: {e}")
+
+
+def get_checkpoint_size_mb(checkpoint_dir: Path) -> float:
+    """Get total size of checkpoints in directory (MB)"""
+    try:
+        total_size = sum(f.stat().st_size for f in checkpoint_dir.rglob("*.pt"))
+        return total_size / (1024 * 1024)
+    except:
+        return 0.0
+
+
+def save_checkpoint(model: nn.Module, 
+                   config: Tier1Config, 
+                   epoch: int, 
+                   metric: float,
+                   dataset_name: str = None,
+                   model_type: str = None,
+                   is_best: bool = False):
+    """
+    Save model checkpoint with clear naming and organization
+    
+    Args:
+        model: Model to save
+        config: Configuration
+        epoch: Current epoch
+        metric: Validation metric (nDCG@10)
+        dataset_name: Name of dataset (e.g., 'MS_MARCO', 'BEIR_Natural_Questions')
+        model_type: Type of model ('supervised' or 'maw')
+        is_best: Whether this is the best checkpoint so far
+    """
+    # Create well-structured checkpoint directory
+    # Structure: checkpoints/tier1/{dataset_name}/{model_type}/
+    base_dir = Path(config.checkpoint_dir)
+    
+    if dataset_name and model_type:
+        # Sanitize dataset name for filesystem
+        safe_dataset_name = dataset_name.replace(' ', '_').replace('-', '_')
+        checkpoint_dir = base_dir / safe_dataset_name / model_type
+    else:
+        checkpoint_dir = base_dir
+    
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
+    # Create descriptive filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_path = checkpoint_dir / f"model_epoch{epoch}_metric{metric:.4f}_{timestamp}.pt"
     
-    torch.save({
+    if is_best:
+        filename = f"BEST_epoch{epoch:03d}_nDCG{metric:.4f}_{timestamp}.pt"
+    else:
+        filename = f"epoch{epoch:03d}_nDCG{metric:.4f}_{timestamp}.pt"
+    
+    checkpoint_path = checkpoint_dir / filename
+    
+    # Save checkpoint with comprehensive metadata
+    checkpoint_data = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
-        'metric': metric,
-        'config': config
-    }, checkpoint_path)
+        'validation_ndcg10': metric,
+        'config': config,
+        'dataset_name': dataset_name,
+        'model_type': model_type,
+        'timestamp': timestamp,
+        'is_best': is_best
+    }
     
-    print(f"Checkpoint saved: {checkpoint_path}")
+    # Save with optional compression to reduce storage
+    if config.checkpoint_compression:
+        torch.save(checkpoint_data, checkpoint_path, _use_new_zipfile_serialization=True)
+    else:
+        torch.save(checkpoint_data, checkpoint_path)
+    
+    # Also save a 'latest.pt' for easy resuming
+    latest_path = checkpoint_dir / "latest.pt"
+    if config.checkpoint_compression:
+        torch.save(checkpoint_data, latest_path, _use_new_zipfile_serialization=True)
+    else:
+        torch.save(checkpoint_data, latest_path)
+    
+    # Save best model separately
+    if is_best:
+        best_path = checkpoint_dir / "best_model.pt"
+        if config.checkpoint_compression:
+            torch.save(checkpoint_data, best_path, _use_new_zipfile_serialization=True)
+        else:
+            torch.save(checkpoint_data, best_path)
+        print(f"✅ BEST checkpoint saved: {checkpoint_path}")
+        
+        # If keep_only_best_checkpoint is True, delete all non-best checkpoints
+        if config.keep_only_best_checkpoint:
+            cleanup_non_best_checkpoints(checkpoint_dir)
+    else:
+        print(f"💾 Checkpoint saved: {checkpoint_path}")
+    
+    # Cleanup old checkpoints if limit is set
+    if config.cleanup_old_checkpoints and config.max_checkpoints_per_model > 0:
+        cleanup_old_checkpoints(checkpoint_dir, config.max_checkpoints_per_model)
 
 
 def run_tier1_evaluation(config: Tier1Config):
@@ -916,28 +1650,44 @@ def run_tier1_evaluation(config: Tier1Config):
         'test': {'queries': msmarco_test.queries, 'corpus': msmarco_test.corpus, 'qrels': msmarco_test.qrels}
     }
     
-    # BEIR - SciDocs
+    # BEIR - Natural Questions
     print("\n" + "=" * 80)
-    print("BEIR - SCIDOCS (EMNLP'20)")
+    print("BEIR - NATURAL QUESTIONS (TACL'19)")
     print("=" * 80)
-    scidocs_test = BEIRDataset('scidocs', split='test', config=config).load_synthetic_data(
-        num_queries=config.test_samples or 100
+    nq_train = BEIRDataset('nq', split='train', config=config).load_synthetic_data(
+        num_queries=config.train_samples or 1000
     )
-    
-    scidocs_data = {
-        'test': {'queries': scidocs_test.queries, 'corpus': scidocs_test.corpus, 'qrels': scidocs_test.qrels}
+    nq_val = BEIRDataset('nq', split='dev', config=config).load_synthetic_data(
+        num_queries=config.val_samples or 200
+    )
+    nq_test = BEIRDataset('nq', split='test', config=config).load_synthetic_data(
+        num_queries=config.test_samples or 200
+    )
+
+    nq_data = {
+        'train': {'queries': nq_train.queries, 'corpus': nq_train.corpus, 'qrels': nq_train.qrels},
+        'val': {'queries': nq_val.queries, 'corpus': nq_val.corpus, 'qrels': nq_val.qrels},
+        'test': {'queries': nq_test.queries, 'corpus': nq_test.corpus, 'qrels': nq_test.qrels}
     }
-    
-    # LoTTE - Science domain
+
+    # BEIR - HotpotQA
     print("\n" + "=" * 80)
-    print("LoTTE - Science (SIGIR'22 - Out-of-domain)")
+    print("BEIR - HOTPOTQA (EMNLP'18)")
     print("=" * 80)
-    lotte_test = LoTTEDataset('science', split='test', config=config).load_synthetic_data(
-        num_queries=config.test_samples or 100
+    hotpot_train = BEIRDataset('hotpotqa', split='train', config=config).load_synthetic_data(
+        num_queries=config.train_samples or 1000
     )
-    
-    lotte_data = {
-        'test': {'queries': lotte_test.queries, 'corpus': lotte_test.corpus, 'qrels': lotte_test.qrels}
+    hotpot_val = BEIRDataset('hotpotqa', split='dev', config=config).load_synthetic_data(
+        num_queries=config.val_samples or 200
+    )
+    hotpot_test = BEIRDataset('hotpotqa', split='test', config=config).load_synthetic_data(
+        num_queries=config.test_samples or 200
+    )
+
+    hotpotqa_data = {
+        'train': {'queries': hotpot_train.queries, 'corpus': hotpot_train.corpus, 'qrels': hotpot_train.qrels},
+        'val': {'queries': hotpot_val.queries, 'corpus': hotpot_val.corpus, 'qrels': hotpot_val.qrels},
+        'test': {'queries': hotpot_test.queries, 'corpus': hotpot_test.corpus, 'qrels': hotpot_test.qrels}
     }
     
     # ==================================================================================
@@ -965,14 +1715,14 @@ def run_tier1_evaluation(config: Tier1Config):
         baseline_model, msmarco_data['test'], config, device, split='test'
     )
     
-    # Evaluate on BEIR SciDocs
-    tier1_results['baseline_zeroshot_scidocs'] = evaluate_retriever(
-        baseline_model, scidocs_data['test'], config, device, split='test'
+    # Evaluate on BEIR Natural Questions
+    tier1_results['baseline_zeroshot_nq'] = evaluate_retriever(
+        baseline_model, nq_data['test'], config, device, split='test'
     )
     
-    # Evaluate on LoTTE
-    tier1_results['baseline_zeroshot_lotte'] = evaluate_retriever(
-        baseline_model, lotte_data['test'], config, device, split='test'
+    # Evaluate on BEIR HotpotQA
+    tier1_results['baseline_zeroshot_hotpotqa'] = evaluate_retriever(
+        baseline_model, hotpotqa_data['test'], config, device, split='test'
     )
     
     # ==================================================================================
@@ -1014,14 +1764,14 @@ def run_tier1_evaluation(config: Tier1Config):
         baseline_lora_model, msmarco_data['test'], lora_config, device, split='test'
     )
     
-    # Evaluate on BEIR SciDocs (out-of-domain)
-    tier2_results['baseline_lora_scidocs'] = evaluate_retriever(
-        baseline_lora_model, scidocs_data['test'], lora_config, device, split='test'
+    # Evaluate on BEIR Natural Questions (out-of-domain)
+    tier2_results['baseline_lora_nq'] = evaluate_retriever(
+        baseline_lora_model, nq_data['test'], lora_config, device, split='test'
     )
     
-    # Evaluate on LoTTE (out-of-domain)
-    tier2_results['baseline_lora_lotte'] = evaluate_retriever(
-        baseline_lora_model, lotte_data['test'], lora_config, device, split='test'
+    # Evaluate on BEIR HotpotQA (out-of-domain)
+    tier2_results['baseline_lora_hotpotqa'] = evaluate_retriever(
+        baseline_lora_model, hotpotqa_data['test'], lora_config, device, split='test'
     )
     
     # ==================================================================================
@@ -1063,14 +1813,14 @@ def run_tier1_evaluation(config: Tier1Config):
         maw_model, msmarco_data['test'], maw_config, device, split='test'
     )
     
-    # Evaluate on BEIR SciDocs (out-of-domain)
-    tier3_results['maw_finetuned_scidocs'] = evaluate_retriever(
-        maw_model, scidocs_data['test'], maw_config, device, split='test'
+    # Evaluate on BEIR Natural Questions (out-of-domain)
+    tier3_results['maw_finetuned_nq'] = evaluate_retriever(
+        maw_model, nq_data['test'], maw_config, device, split='test'
     )
     
-    # Evaluate on LoTTE (out-of-domain)
-    tier3_results['maw_finetuned_lotte'] = evaluate_retriever(
-        maw_model, lotte_data['test'], maw_config, device, split='test'
+    # Evaluate on BEIR HotpotQA (out-of-domain)
+    tier3_results['maw_finetuned_hotpotqa'] = evaluate_retriever(
+        maw_model, hotpotqa_data['test'], maw_config, device, split='test'
     )
     
     # ==================================================================================
@@ -1139,15 +1889,15 @@ def run_tier1_evaluation(config: Tier1Config):
     print(f"  Tier 2 (LoRA):      nDCG@10 = {tier2_results['baseline_lora_msmarco']['nDCG@10']:.4f}")
     print(f"  Tier 3 (MAW):       nDCG@10 = {tier3_results['maw_finetuned_msmarco']['nDCG@10']:.4f}")
     
-    print("\nBEIR SciDocs (Out-of-domain):")
-    print(f"  Tier 1 (Zero-shot): nDCG@10 = {tier1_results['baseline_zeroshot_scidocs']['nDCG@10']:.4f}")
-    print(f"  Tier 2 (LoRA):      nDCG@10 = {tier2_results['baseline_lora_scidocs']['nDCG@10']:.4f}")
-    print(f"  Tier 3 (MAW):       nDCG@10 = {tier3_results['maw_finetuned_scidocs']['nDCG@10']:.4f}")
+    print("\nBEIR Natural Questions (Out-of-domain):")
+    print(f"  Tier 1 (Zero-shot): nDCG@10 = {tier1_results['baseline_zeroshot_nq']['nDCG@10']:.4f}")
+    print(f"  Tier 2 (LoRA):      nDCG@10 = {tier2_results['baseline_lora_nq']['nDCG@10']:.4f}")
+    print(f"  Tier 3 (MAW):       nDCG@10 = {tier3_results['maw_finetuned_nq']['nDCG@10']:.4f}")
     
-    print("\nLoTTE Science (Out-of-domain):")
-    print(f"  Tier 1 (Zero-shot): Success@5 = {tier1_results['baseline_zeroshot_lotte']['Success@5']:.4f}")
-    print(f"  Tier 2 (LoRA):      Success@5 = {tier2_results['baseline_lora_lotte']['Success@5']:.4f}")
-    print(f"  Tier 3 (MAW):       Success@5 = {tier3_results['maw_finetuned_lotte']['Success@5']:.4f}")
+    print("\nBEIR HotpotQA (Out-of-domain):")
+    print(f"  Tier 1 (Zero-shot): nDCG@10 = {tier1_results['baseline_zeroshot_hotpotqa']['nDCG@10']:.4f}")
+    print(f"  Tier 2 (LoRA):      nDCG@10 = {tier2_results['baseline_lora_hotpotqa']['nDCG@10']:.4f}")
+    print(f"  Tier 3 (MAW):       nDCG@10 = {tier3_results['maw_finetuned_hotpotqa']['nDCG@10']:.4f}")
     
     print(f"\n{'='*80}\n")
     
@@ -1168,13 +1918,38 @@ def run_complete_benchmark(config: Tier1Config):
     set_random_seed(config.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
+    # Multi-GPU setup
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    
     print(f"\n{'='*100}")
     print(f"{'TIER-1 BENCHMARK EVALUATION SUITE':^100}")
     print(f"{'='*100}")
     print(f"{'Following standards from SIGIR, WWW, WSDM, NeurIPS':^100}")
     print(f"{'='*100}")
     print(f"Device: {device}")
-    print(f"Seed: {config.seed}")
+    
+    # Multi-GPU information
+    if num_gpus > 0:
+        print(f"🚀 GPUs Available: {num_gpus}")
+        for i in range(num_gpus):
+            gpu_name = torch.cuda.get_device_name(i)
+            gpu_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)
+            print(f"   GPU {i}: {gpu_name} ({gpu_mem:.1f} GB)")
+        if config.use_multi_gpu and num_gpus > 1:
+            print(f"✅ Multi-GPU: ENABLED (DataParallel)")
+        if config.parallel_datasets and num_gpus >= 4:
+            print(f"✅ Parallel Datasets: ENABLED (4 datasets on 4 GPUs)")
+    
+    print(f"\n⚙️  Storage Optimization Settings:")
+    print(f"   Keep only best checkpoint:    {config.keep_only_best_checkpoint}")
+    print(f"   Max checkpoints per model:    {config.max_checkpoints_per_model if config.max_checkpoints_per_model > 0 else 'Unlimited'}")
+    print(f"   Checkpoint compression:       {config.checkpoint_compression}")
+    print(f"   Log compression (gzip):       {config.compress_logs}")
+    print(f"   Max log files to keep:        {config.max_log_files if config.max_log_files > 0 else 'Unlimited'}")
+    print(f"   Clear CUDA cache:             {config.clear_cuda_cache}")
+    print(f"   Clear embeddings after eval:  {config.clear_embeddings_after_eval}")
+    
+    print(f"\nSeed: {config.seed}")
     print(f"Layers: {config.num_layers} | MAW Layers: {config.maw_layers}")
     print(f"Epochs: {config.num_epochs} | Batch Size: {config.batch_size} | LR: {config.learning_rate}")
     print(f"{'='*100}\n")
@@ -1188,37 +1963,41 @@ def run_complete_benchmark(config: Tier1Config):
             'name': 'MS MARCO',
             'type': 'msmarco',
             'venue': 'MSFT/TREC',
-            'metrics': ['MRR@10', 'Recall@100', 'nDCG@10'],
+            'primary_metrics': ['MRR@1000', 'nDCG@10', 'Recall@100'],  # Primary metrics for display
+            'all_metrics': TIER1_METRICS,  # All comprehensive metrics
             'train_size': config.train_samples or 2000,
             'val_size': config.val_samples or 500,
             'test_size': config.test_samples or 1000,
         },
         {
-            'name': 'BEIR SciDocs',
-            'type': 'beir_scidocs',
-            'venue': 'EMNLP 2020',
-            'metrics': ['nDCG@10', 'Recall@100'],
-            'train_size': None,  # No train set for BEIR (zero-shot + domain transfer)
-            'val_size': None,
+            'name': 'BEIR Natural Questions',
+            'type': 'beir_nq',
+            'venue': 'TACL 2019',
+            'primary_metrics': ['nDCG@10', 'Recall@100', 'Precision@10'],  # Primary metrics for display
+            'all_metrics': TIER1_METRICS,  # All comprehensive metrics
+            'train_size': config.train_samples or 2000,
+            'val_size': config.val_samples or 500,
             'test_size': config.test_samples or 1000,
         },
         {
-            'name': 'BEIR SciFact',
-            'type': 'beir_scifact',
-            'venue': 'EMNLP 2020',
-            'metrics': ['nDCG@10', 'Recall@100'],
-            'train_size': None,
-            'val_size': None,
-            'test_size': config.test_samples or 300,
+            'name': 'BEIR HotpotQA',
+            'type': 'beir_hotpotqa',
+            'venue': 'EMNLP 2018',
+            'primary_metrics': ['nDCG@10', 'Recall@100', 'Precision@10'],  # Primary metrics for display
+            'all_metrics': TIER1_METRICS,  # All comprehensive metrics
+            'train_size': config.train_samples or 2000,
+            'val_size': config.val_samples or 500,
+            'test_size': config.test_samples or 1000,
         },
         {
-            'name': 'LoTTE Science',
-            'type': 'lotte_science',
-            'venue': 'SIGIR 2022',
-            'metrics': ['Success@5', 'nDCG@10', 'Recall@100'],
-            'train_size': None,  # Out-of-domain evaluation
-            'val_size': None,
-            'test_size': config.test_samples or 500,
+            'name': 'BEIR TriviaQA',
+            'type': 'beir_triviaqa',
+            'venue': 'EMNLP 2017',
+            'primary_metrics': ['nDCG@10', 'Recall@100', 'Precision@10'],  # Primary metrics for display
+            'all_metrics': TIER1_METRICS,  # All comprehensive metrics
+            'train_size': config.train_samples or 2000,
+            'val_size': config.val_samples or 500,
+            'test_size': config.test_samples or 1000,
         },
     ]
     
@@ -1259,33 +2038,20 @@ def run_complete_benchmark(config: Tier1Config):
             
         elif dataset_type.startswith('beir_'):
             beir_dataset = dataset_type.replace('beir_', '')
+
+            train_dict = None
+            val_dict = None
+
+            if dataset_info.get('train_size'):
+                train_data = BEIRDataset(beir_dataset, 'train', config).load_synthetic_data(dataset_info['train_size'])
+                train_dict = {'queries': train_data.queries, 'corpus': train_data.corpus, 'qrels': train_data.qrels}
+
+            if dataset_info.get('val_size'):
+                val_data = BEIRDataset(beir_dataset, 'dev', config).load_synthetic_data(dataset_info['val_size'])
+                val_dict = {'queries': val_data.queries, 'corpus': val_data.corpus, 'qrels': val_data.qrels}
+
             test_data = BEIRDataset(beir_dataset, 'test', config).load_synthetic_data(dataset_info['test_size'])
             test_dict = {'queries': test_data.queries, 'corpus': test_data.corpus, 'qrels': test_data.qrels}
-            
-            # Use MS MARCO for training (domain transfer)
-            if config.train_samples:
-                train_data = MSMARCODataset('train', config).load_synthetic_data(config.train_samples or 2000)
-                val_data = MSMARCODataset('dev', config).load_synthetic_data(config.val_samples or 500)
-                train_dict = {'queries': train_data.queries, 'corpus': train_data.corpus, 'qrels': train_data.qrels}
-                val_dict = {'queries': val_data.queries, 'corpus': val_data.corpus, 'qrels': val_data.qrels}
-            else:
-                train_dict = None
-                val_dict = None
-                
-        elif dataset_type.startswith('lotte_'):
-            domain = dataset_type.replace('lotte_', '')
-            test_data = LoTTEDataset(domain, 'test', config=config).load_synthetic_data(dataset_info['test_size'])
-            test_dict = {'queries': test_data.queries, 'corpus': test_data.corpus, 'qrels': test_data.qrels}
-            
-            # Use MS MARCO for training (out-of-domain)
-            if config.train_samples:
-                train_data = MSMARCODataset('train', config).load_synthetic_data(config.train_samples or 2000)
-                val_data = MSMARCODataset('dev', config).load_synthetic_data(config.val_samples or 500)
-                train_dict = {'queries': train_data.queries, 'corpus': train_data.corpus, 'qrels': train_data.qrels}
-                val_dict = {'queries': val_data.queries, 'corpus': val_data.corpus, 'qrels': val_data.qrels}
-            else:
-                train_dict = None
-                val_dict = None
         else:
             raise ValueError(f"Unknown dataset type: {dataset_type}")
         
@@ -1314,10 +2080,11 @@ def run_complete_benchmark(config: Tier1Config):
         )
         dataset_results['zeroshot'] = zeroshot_results
         
-        print(f"✅ Zero-shot results:")
-        for metric in dataset_info['metrics']:
+        print(f"✅ Zero-shot results (primary metrics):")
+        for metric in dataset_info['primary_metrics']:
             if metric in zeroshot_results:
                 print(f"   {metric}: {zeroshot_results[metric]:.4f}")
+        print(f"   (+ {len(zeroshot_results)} total TIER-1 metrics computed)")
         
         # ==============================================================================
         # 2. SUPERVISED FINE-TUNED RETRIEVAL
@@ -1344,7 +2111,9 @@ def run_complete_benchmark(config: Tier1Config):
             
             # Train on train set only
             train_history = train_retriever(
-                supervised_model, train_dict, val_dict, supervised_config, device
+                supervised_model, train_dict, val_dict, supervised_config, device,
+                dataset_name=dataset_name,
+                model_type='supervised'
             )
             
             # Evaluate on test set
@@ -1356,10 +2125,11 @@ def run_complete_benchmark(config: Tier1Config):
                 'training_history': train_history
             }
             
-            print(f"✅ Supervised fine-tuned results:")
-            for metric in dataset_info['metrics']:
+            print(f"✅ Supervised fine-tuned results (primary metrics):")
+            for metric in dataset_info['primary_metrics']:
                 if metric in supervised_results:
                     print(f"   {metric}: {supervised_results[metric]:.4f}")
+            print(f"   (+ {len(supervised_results)} total TIER-1 metrics computed)")
         else:
             print(f"\n{'-'*100}")
             print(f"⚠️  No training data available for {dataset_name} - Skipping supervised fine-tuning")
@@ -1393,7 +2163,9 @@ def run_complete_benchmark(config: Tier1Config):
             
             # Train on train set only
             train_history = train_retriever(
-                maw_model, train_dict, val_dict, maw_config, device
+                maw_model, train_dict, val_dict, maw_config, device,
+                dataset_name=dataset_name,
+                model_type='maw'
             )
             
             # Evaluate on test set
@@ -1405,10 +2177,11 @@ def run_complete_benchmark(config: Tier1Config):
                 'training_history': train_history
             }
             
-            print(f"✅ MAW fine-tuned results:")
-            for metric in dataset_info['metrics']:
+            print(f"✅ MAW fine-tuned results (primary metrics):")
+            for metric in dataset_info['primary_metrics']:
                 if metric in maw_results:
                     print(f"   {metric}: {maw_results[metric]:.4f}")
+            print(f"   (+ {len(maw_results)} total TIER-1 metrics computed)")
         else:
             print(f"\n{'-'*100}")
             print(f"⚠️  No training data available for {dataset_name} - Skipping MAW fine-tuning")
@@ -1420,23 +2193,23 @@ def run_complete_benchmark(config: Tier1Config):
         # ==============================================================================
         
         print(f"\n{'='*100}")
-        summary_title = f'SUMMARY: {dataset_name}'
+        summary_title = f'SUMMARY: {dataset_name} (Primary Metrics)'
         print(f"{summary_title:^100}")
         print(f"{'='*100}\n")
         
-        print(f"{'Approach':<30} {'|':^5} {' | '.join(dataset_info['metrics'])}")
+        print(f"{'Approach':<30} {'|':^5} {' | '.join(dataset_info['primary_metrics'])}")
         print(f"{'-'*100}")
         
         # Zero-shot
-        metrics_str = ' | '.join([f"{zeroshot_results.get(m, 0.0):.4f}" for m in dataset_info['metrics']])
+        metrics_str = ' | '.join([f"{zeroshot_results.get(m, 0.0):.4f}" for m in dataset_info['primary_metrics']])
         print(f"{'Zero-shot (No Training)':<30} {'|':^5} {metrics_str}")
         
         # Supervised
         if dataset_results['supervised']:
             supervised_metrics = dataset_results['supervised']['metrics']
-            metrics_str = ' | '.join([f"{supervised_metrics.get(m, 0.0):.4f}" for m in dataset_info['metrics']])
+            metrics_str = ' | '.join([f"{supervised_metrics.get(m, 0.0):.4f}" for m in dataset_info['primary_metrics']])
             # Calculate improvement for primary metric (first in list)
-            primary_metric = dataset_info['metrics'][0]
+            primary_metric = dataset_info['primary_metrics'][0]
             if primary_metric in zeroshot_results and primary_metric in supervised_metrics:
                 abs_improvement = supervised_metrics[primary_metric] - zeroshot_results[primary_metric]
                 rel_improvement = (abs_improvement / zeroshot_results[primary_metric] * 100) if zeroshot_results[primary_metric] > 0 else 0
@@ -1449,9 +2222,9 @@ def run_complete_benchmark(config: Tier1Config):
         # MAW
         if dataset_results['maw']:
             maw_metrics = dataset_results['maw']['metrics']
-            metrics_str = ' | '.join([f"{maw_metrics.get(m, 0.0):.4f}" for m in dataset_info['metrics']])
+            metrics_str = ' | '.join([f"{maw_metrics.get(m, 0.0):.4f}" for m in dataset_info['primary_metrics']])
             # Calculate improvement vs zero-shot and vs supervised
-            primary_metric = dataset_info['metrics'][0]
+            primary_metric = dataset_info['primary_metrics'][0]
             if primary_metric in zeroshot_results and primary_metric in maw_metrics:
                 abs_improvement = maw_metrics[primary_metric] - zeroshot_results[primary_metric]
                 rel_improvement = (abs_improvement / zeroshot_results[primary_metric] * 100) if zeroshot_results[primary_metric] > 0 else 0
@@ -1460,13 +2233,17 @@ def run_complete_benchmark(config: Tier1Config):
                 print(f"{'MAW Fine-tuned':<30} {'|':^5} {metrics_str}")
             
             # Show MAW vs Supervised comparison
-            if dataset_results['supervised'] and primary_metric in supervised_metrics and primary_metric in maw_metrics:
-                abs_improvement_vs_sup = maw_metrics[primary_metric] - supervised_metrics[primary_metric]
+            if dataset_results['supervised']:
+                supervised_metrics = dataset_results['supervised']['metrics']
+                if primary_metric in supervised_metrics and primary_metric in maw_metrics:
+                    abs_improvement_vs_sup = maw_metrics[primary_metric] - supervised_metrics[primary_metric]
                 rel_improvement_vs_sup = (abs_improvement_vs_sup / supervised_metrics[primary_metric] * 100) if supervised_metrics[primary_metric] > 0 else 0
                 print(f"{'  → MAW vs Supervised':<30} {'':^5} {'':<50}  (Δ {primary_metric}: {abs_improvement_vs_sup:+.4f} / {rel_improvement_vs_sup:+.2f}%)")
         else:
             print(f"{'MAW Fine-tuned':<30} {'|':^5} N/A (No training data)")
         
+        print(f"{'='*100}")
+        print(f"📊 Note: All {len(TIER1_METRICS)} comprehensive TIER-1 metrics computed and saved to JSON")
         print(f"{'='*100}\n")
         
         # ==============================================================================
@@ -1515,11 +2292,12 @@ def run_complete_benchmark(config: Tier1Config):
             'improvements': {}
         }
         
-        # Calculate improvements
+        # Calculate improvements for ALL metrics
         if dataset_results['supervised']:
             supervised_metrics = dataset_results['supervised']['metrics']
-            for metric in dataset_info['metrics']:
-                if metric in zeroshot_results and metric in supervised_metrics:
+            # Calculate for all metrics in the results
+            for metric in supervised_metrics.keys():
+                if metric in zeroshot_results:
                     dataset_json['improvements'][f'supervised_vs_zeroshot_{metric}'] = {
                         'absolute': supervised_metrics[metric] - zeroshot_results[metric],
                         'relative_pct': ((supervised_metrics[metric] - zeroshot_results[metric]) / zeroshot_results[metric] * 100) if zeroshot_results[metric] > 0 else 0
@@ -1527,13 +2305,19 @@ def run_complete_benchmark(config: Tier1Config):
         
         if dataset_results['maw']:
             maw_metrics = dataset_results['maw']['metrics']
-            for metric in dataset_info['metrics']:
-                if metric in zeroshot_results and metric in maw_metrics:
+            supervised_metrics = dataset_results['supervised']['metrics'] if dataset_results['supervised'] else {}
+            
+            # Calculate for all metrics in the results
+            for metric in maw_metrics.keys():
+                # MAW vs Zero-shot
+                if metric in zeroshot_results:
                     dataset_json['improvements'][f'maw_vs_zeroshot_{metric}'] = {
                         'absolute': maw_metrics[metric] - zeroshot_results[metric],
                         'relative_pct': ((maw_metrics[metric] - zeroshot_results[metric]) / zeroshot_results[metric] * 100) if zeroshot_results[metric] > 0 else 0
                     }
-                if dataset_results['supervised'] and metric in supervised_metrics and metric in maw_metrics:
+                
+                # MAW vs Supervised
+                if metric in supervised_metrics:
                     dataset_json['improvements'][f'maw_vs_supervised_{metric}'] = {
                         'absolute': maw_metrics[metric] - supervised_metrics[metric],
                         'relative_pct': ((maw_metrics[metric] - supervised_metrics[metric]) / supervised_metrics[metric] * 100) if supervised_metrics[metric] > 0 else 0
@@ -1542,15 +2326,47 @@ def run_complete_benchmark(config: Tier1Config):
         # Save per-dataset JSON file
         dataset_filename = dataset_name.lower().replace(' ', '_').replace('-', '_')
         dataset_json_path = log_dir / f"{dataset_filename}_results.json"
-        with open(dataset_json_path, 'w') as f:
-            json.dump(dataset_json, f, indent=2)
         
-        print(f"💾 Saved dataset results: {dataset_json_path}\n")
+        # Save with optional compression
+        if config.compress_logs:
+            import gzip
+            with gzip.open(f"{dataset_json_path}.gz", 'wt', encoding='utf-8') as f:
+                json.dump(dataset_json, f, indent=2)
+            print(f"💾 Saved compressed dataset results: {dataset_json_path}.gz")
+        else:
+            with open(dataset_json_path, 'w') as f:
+                json.dump(dataset_json, f, indent=2)
+            print(f"💾 Saved dataset results: {dataset_json_path}")
+        
+        print()
         
         all_results['datasets'][dataset_name] = {
             'dataset_info': dataset_info,
             'results': dataset_results
         }
+        
+        # ============================================================================
+        # MEMORY CLEANUP BETWEEN DATASETS (Prevent GPU memory overflow)
+        # ============================================================================
+        if config.clear_cuda_cache and torch.cuda.is_available():
+            print(f"🧹 Cleaning up GPU memory...")
+            # Delete models to free GPU memory
+            if 'zeroshot_model' in locals():
+                del zeroshot_model
+            if 'supervised_model' in locals():
+                del supervised_model
+            if 'maw_model' in locals():
+                del maw_model
+            
+            # Clear CUDA cache
+            torch.cuda.empty_cache()
+            
+            # Report memory
+            for i in range(torch.cuda.device_count()):
+                allocated = torch.cuda.memory_allocated(i) / (1024**3)
+                reserved = torch.cuda.memory_reserved(i) / (1024**3)
+                print(f"   GPU {i}: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+            print()
     
     # ==================================================================================
     # SAVE COMPREHENSIVE RESULTS
@@ -1561,10 +2377,34 @@ def run_complete_benchmark(config: Tier1Config):
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Save JSON results
-    json_path = log_dir / f"tier1_complete_benchmark_{timestamp}.json"
-    with open(json_path, 'w') as f:
-        json.dump(all_results, f, indent=2)
+    # Save JSON results with optional compression
+    if config.compress_logs:
+        import gzip
+        json_path = log_dir / f"tier1_complete_benchmark_{timestamp}.json.gz"
+        with gzip.open(json_path, 'wt', encoding='utf-8') as f:
+            json.dump(all_results, f, indent=2)
+        print(f"💾 Saved compressed complete results: {json_path}")
+    else:
+        json_path = log_dir / f"tier1_complete_benchmark_{timestamp}.json"
+        with open(json_path, 'w') as f:
+            json.dump(all_results, f, indent=2)
+        print(f"💾 Saved complete results: {json_path}")
+    
+    # Cleanup old log files if limit is set
+    if config.max_log_files > 0:
+        cleanup_old_log_files(log_dir, config.max_log_files, config.compress_logs)
+    
+    # Delete per-dataset logs if keep_only_summary_logs is True
+    if config.keep_only_summary_logs:
+        for dataset_name in all_results['datasets'].keys():
+            dataset_filename = dataset_name.lower().replace(' ', '_').replace('-', '_')
+            if config.compress_logs:
+                dataset_log = log_dir / f"{dataset_filename}_results.json.gz"
+            else:
+                dataset_log = log_dir / f"{dataset_filename}_results.json"
+            if dataset_log.exists():
+                dataset_log.unlink()
+                print(f"🗑️  Deleted per-dataset log: {dataset_log.name}")
     
     # Save text summary
     txt_path = log_dir / f"tier1_complete_benchmark_{timestamp}.txt"
@@ -1587,14 +2427,19 @@ def run_complete_benchmark(config: Tier1Config):
             f.write("="*100 + "\n\n")
             
             results = dataset_data['results']
-            metrics = dataset_data['dataset_info']['metrics']
+            primary_metrics = dataset_data['dataset_info']['primary_metrics']
+            
+            # Header for comprehensive metrics
+            f.write(f"All {len(TIER1_METRICS)} TIER-1 metrics computed (showing primary metrics below)\n\n")
             
             # 1. Zero-shot results
             if results['zeroshot']:
                 f.write("1. NORMAL RETRIEVER (Zero-shot - No Training):\n")
-                for metric in metrics:
+                f.write("   Primary Metrics:\n")
+                for metric in primary_metrics:
                     if metric in results['zeroshot']:
-                        f.write(f"  {metric}: {results['zeroshot'][metric]:.4f}\n")
+                        f.write(f"     {metric}: {results['zeroshot'][metric]:.4f}\n")
+                f.write(f"   Total metrics computed: {len(results['zeroshot'])}\n")
                 f.write("\n")
             else:
                 f.write("1. NORMAL RETRIEVER: N/A\n\n")
@@ -1603,15 +2448,17 @@ def run_complete_benchmark(config: Tier1Config):
             if results['supervised']:
                 supervised_metrics = results['supervised']['metrics']
                 f.write("2. LORA SUPERVISED RETRIEVER (LoRA Fine-tuned):\n")
-                for metric in metrics:
+                f.write("   Primary Metrics:\n")
+                for metric in primary_metrics:
                     if metric in supervised_metrics:
-                        f.write(f"  {metric}: {supervised_metrics[metric]:.4f}")
+                        f.write(f"     {metric}: {supervised_metrics[metric]:.4f}")
                         # Add improvement vs zero-shot
                         if results['zeroshot'] and metric in results['zeroshot']:
                             abs_imp = supervised_metrics[metric] - results['zeroshot'][metric]
                             rel_imp = (abs_imp / results['zeroshot'][metric] * 100) if results['zeroshot'][metric] > 0 else 0
                             f.write(f"  (vs zero-shot: {abs_imp:+.4f} / {rel_imp:+.2f}%)")
                         f.write("\n")
+                f.write(f"   Total metrics computed: {len(supervised_metrics)}\n")
                 f.write("\n")
             else:
                 f.write("2. LORA SUPERVISED RETRIEVER: N/A (No training data)\n\n")
@@ -1620,26 +2467,28 @@ def run_complete_benchmark(config: Tier1Config):
             if results['maw']:
                 maw_metrics = results['maw']['metrics']
                 f.write("3. MAW SUPERVISED RETRIEVER (GRPO on last layer):\n")
-                for metric in metrics:
+                f.write("   Primary Metrics:\n")
+                for metric in primary_metrics:
                     if metric in maw_metrics:
-                        f.write(f"  {metric}: {maw_metrics[metric]:.4f}")
+                        f.write(f"     {metric}: {maw_metrics[metric]:.4f}")
                         # Add improvement vs zero-shot
                         if results['zeroshot'] and metric in results['zeroshot']:
                             abs_imp = maw_metrics[metric] - results['zeroshot'][metric]
                             rel_imp = (abs_imp / results['zeroshot'][metric] * 100) if results['zeroshot'][metric] > 0 else 0
                             f.write(f"  (vs zero-shot: {abs_imp:+.4f} / {rel_imp:+.2f}%)")
                         f.write("\n")
+                f.write(f"   Total metrics computed: {len(maw_metrics)}\n")
                 f.write("\n")
                 
                 # Key comparison: MAW vs Supervised
                 if results['supervised']:
-                    f.write("KEY COMPARISON - MAW vs Supervised Baseline:\n")
+                    f.write("   KEY COMPARISON - MAW vs Supervised Baseline (Primary Metrics):\n")
                     supervised_metrics = results['supervised']['metrics']
-                    for metric in metrics:
+                    for metric in primary_metrics:
                         if metric in maw_metrics and metric in supervised_metrics:
                             abs_imp = maw_metrics[metric] - supervised_metrics[metric]
                             rel_imp = (abs_imp / supervised_metrics[metric] * 100) if supervised_metrics[metric] > 0 else 0
-                            f.write(f"  {metric}: {abs_imp:+.4f} absolute / {rel_imp:+.2f}% relative\n")
+                            f.write(f"     {metric}: {abs_imp:+.4f} absolute / {rel_imp:+.2f}% relative\n")
                     f.write("\n")
             else:
                 f.write("3. MAW SUPERVISED RETRIEVER: N/A (No training data)\n\n")
@@ -1647,21 +2496,351 @@ def run_complete_benchmark(config: Tier1Config):
     print(f"\n{'='*100}")
     print(f"{'BENCHMARK COMPLETE':^100}")
     print(f"{'='*100}\n")
-    print(f"Results saved:")
-    print(f"  Complete JSON: {json_path}")
-    print(f"  Summary TXT:   {txt_path}")
-    print(f"\n  Per-Dataset JSON files in: {log_dir}/")
+    # Create README files for easy navigation
+    create_output_readme(log_dir, timestamp)
+    create_checkpoint_readme(Path(config.checkpoint_dir))
+    
+    # Print comprehensive summary
+    print(f"\n{'='*100}")
+    print(f"{'✅ TIER-1 EVALUATION COMPLETE':^100}")
+    print(f"{'='*100}\n")
+    
+    print(f"📊 RESULTS SAVED:")
+    print(f"   Complete JSON:  {json_path}")
+    print(f"   Summary TXT:    {txt_path}")
+    print(f"   Documentation:  {log_dir / 'README_RESULTS.md'}")
+    
+    print(f"\n📁 PER-DATASET RESULTS:")
     for dataset_info in [
         {'name': 'MS MARCO', 'type': 'msmarco'},
-        {'name': 'BEIR SciDocs', 'type': 'beir_scidocs'},
-        {'name': 'BEIR SciFact', 'type': 'beir_scifact'},
-        {'name': 'LoTTE Science', 'type': 'lotte_science'},
+        {'name': 'BEIR Natural Questions', 'type': 'beir_nq'},
+        {'name': 'BEIR HotpotQA', 'type': 'beir_hotpotqa'},
+        {'name': 'BEIR TriviaQA', 'type': 'beir_triviaqa'},
     ]:
         dataset_filename = dataset_info['name'].lower().replace(' ', '_').replace('-', '_')
-        print(f"    - {dataset_filename}_results.json")
+        json_file = log_dir / f"{dataset_filename}_results.json"
+        if json_file.exists():
+            print(f"   ✓ {dataset_filename}_results.json")
+    
+    print(f"\n💾 MODEL CHECKPOINTS:")
+    checkpoint_base = Path(config.checkpoint_dir)
+    print(f"   Base directory: {checkpoint_base}")
+    print(f"   Documentation:  {checkpoint_base / 'README_CHECKPOINTS.md'}")
+    print(f"\n   Structure:")
+    for dataset_info in [
+        {'name': 'MS MARCO'},
+        {'name': 'BEIR Natural Questions'},
+        {'name': 'BEIR HotpotQA'},
+        {'name': 'BEIR TriviaQA'},
+    ]:
+        safe_name = dataset_info['name'].replace(' ', '_').replace('-', '_')
+        dataset_dir = checkpoint_base / safe_name
+        if dataset_dir.exists():
+            print(f"   📂 {safe_name}/")
+            for model_type in ['supervised', 'maw']:
+                model_dir = dataset_dir / model_type
+                if model_dir.exists():
+                    print(f"      └── {model_type}/")
+                    if (model_dir / 'best_model.pt').exists():
+                        print(f"          ├── best_model.pt")
+                    if (model_dir / 'latest.pt').exists():
+                        print(f"          ├── latest.pt")
+                    # Count other checkpoints
+                    checkpoints = list(model_dir.glob('epoch*.pt'))
+                    if checkpoints:
+                        print(f"          └── {len(checkpoints)} epoch checkpoint(s)")
+    
+    print(f"\n📖 DOCUMENTATION:")
+    print(f"   • README_RESULTS.md - Explains result files and metrics")
+    print(f"   • README_CHECKPOINTS.md - Explains how to load and use model checkpoints")
+    
+    # ============================================================================
+    # STORAGE REPORT (Help monitor disk usage)
+    # ============================================================================
+    print(f"\n{'='*100}")
+    print(f"{'💾 STORAGE REPORT':^100}")
+    print(f"{'='*100}")
+    
+    # Calculate checkpoint sizes
+    total_checkpoint_size = 0
+    if checkpoint_base.exists():
+        for pt_file in checkpoint_base.rglob("*.pt"):
+            total_checkpoint_size += pt_file.stat().st_size
+    total_checkpoint_mb = total_checkpoint_size / (1024 * 1024)
+    total_checkpoint_gb = total_checkpoint_mb / 1024
+    
+    # Calculate log sizes
+    total_log_size = 0
+    if log_dir.exists():
+        for log_file in log_dir.rglob("*"):
+            if log_file.is_file():
+                total_log_size += log_file.stat().st_size
+    total_log_mb = total_log_size / (1024 * 1024)
+    total_log_gb = total_log_mb / 1024
+    
+    print(f"\n📊 Storage Usage:")
+    if total_checkpoint_gb >= 1:
+        print(f"   Checkpoints: {total_checkpoint_gb:.2f} GB ({total_checkpoint_mb:.0f} MB)")
+    else:
+        print(f"   Checkpoints: {total_checkpoint_mb:.2f} MB")
+    
+    if total_log_gb >= 1:
+        print(f"   Logs:        {total_log_gb:.2f} GB ({total_log_mb:.0f} MB)")
+    else:
+        print(f"   Logs:        {total_log_mb:.2f} MB")
+    
+    total_gb = total_checkpoint_gb + total_log_gb
+    total_mb = total_checkpoint_mb + total_log_mb
+    if total_gb >= 1:
+        print(f"   TOTAL:       {total_gb:.2f} GB ({total_mb:.0f} MB)")
+    else:
+        print(f"   TOTAL:       {total_mb:.2f} MB")
+    
+    print(f"\n⚙️  Storage Optimization Settings:")
+    print(f"   Keep only best checkpoint:    {config.keep_only_best_checkpoint}")
+    print(f"   Max checkpoints per model:    {config.max_checkpoints_per_model if config.max_checkpoints_per_model > 0 else 'Unlimited'}")
+    print(f"   Checkpoint compression:       {config.checkpoint_compression}")
+    print(f"   Log compression:              {config.compress_logs}")
+    print(f"   Max log files:                {config.max_log_files if config.max_log_files > 0 else 'Unlimited'}")
+    print(f"   Clear CUDA cache:             {config.clear_cuda_cache}")
+    print(f"   Clear embeddings after eval:  {config.clear_embeddings_after_eval}")
+    
+    if total_gb > 10:
+        print(f"\n⚠️  WARNING: Storage usage is high ({total_gb:.1f} GB)!")
+        print(f"   Consider enabling more aggressive cleanup:")
+        print(f"   • Set keep_only_best_checkpoint=True")
+        print(f"   • Set max_checkpoints_per_model=1 or 2")
+        print(f"   • Set max_log_files=5")
+        print(f"   • Enable checkpoint_compression and compress_logs")
+    elif total_gb > 5:
+        print(f"\n💡 TIP: Storage usage is moderate ({total_gb:.1f} GB).")
+        print(f"   Monitor disk space and consider cleanup if needed.")
+    else:
+        print(f"\n✅ Storage usage is optimal ({total_gb:.2f} GB).")
+    
     print(f"\n{'='*100}\n")
     
     return all_results
+
+
+def create_output_readme(log_dir: Path, timestamp: str):
+    """Create a README explaining the output structure"""
+    readme_path = log_dir / "README_RESULTS.md"
+    
+    with open(readme_path, 'w') as f:
+        f.write("# Tier-1 Evaluation Results\n\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        f.write("## 📁 Folder Structure\n\n")
+        f.write("```\n")
+        f.write("logs/tier1/\n")
+        f.write("├── README_RESULTS.md                          # This file\n")
+        f.write("├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.json  # Complete results (all datasets)\n")
+        f.write("├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.txt   # Human-readable summary\n")
+        f.write("├── ms_marco_results.json                      # Per-dataset results\n")
+        f.write("├── beir_natural_questions_results.json\n")
+        f.write("├── beir_hotpotqa_results.json\n")
+        f.write("└── beir_triviaqa_results.json\n")
+        f.write("```\n\n")
+        
+        f.write("## 📊 File Descriptions\n\n")
+        f.write("### Complete Benchmark Files\n")
+        f.write("- **`tier1_complete_benchmark_*.json`**: Complete results for all datasets\n")
+        f.write("  - Contains configuration, all metrics, training history\n")
+        f.write("  - Machine-readable format for analysis\n\n")
+        f.write("- **`tier1_complete_benchmark_*.txt`**: Human-readable summary\n")
+        f.write("  - Easy-to-read text format\n")
+        f.write("  - Includes improvements (absolute + relative %)\n\n")
+        
+        f.write("### Per-Dataset JSON Files\n")
+        f.write("Each dataset has its own JSON file with:\n")
+        f.write("- **Configuration**: Seeds, hyperparameters, etc.\n")
+        f.write("- **Results**:\n")
+        f.write("  1. `1_normal_retriever`: Zero-shot (no training)\n")
+        f.write("  2. `2_lora_supervised_retriever`: LoRA fine-tuned\n")
+        f.write("  3. `3_maw_supervised_retriever`: MAW fine-tuned\n")
+        f.write("- **Improvements**: Absolute and relative % improvements\n")
+        f.write("- **Training History**: Loss curves, validation metrics\n\n")
+        
+        f.write("## 🎯 Three Evaluation Methods\n\n")
+        f.write("1. **Normal Retriever (Zero-shot)**\n")
+        f.write("   - No training, baseline performance\n")
+        f.write("   - Uses pre-trained model as-is\n\n")
+        
+        f.write("2. **LoRA Supervised Retriever**\n")
+        f.write("   - Fine-tuned using LoRA on last layer\n")
+        f.write("   - Trained on training set, validated on validation set\n")
+        f.write("   - Evaluated on test set (unseen during training)\n\n")
+        
+        f.write("3. **MAW Supervised Retriever**\n")
+        f.write("   - Fine-tuned using Multi-Attention-Weight mechanism\n")
+        f.write("   - GRPO (Group Relative Policy Optimization) on last layer\n")
+        f.write("   - Trained on training set, validated on validation set\n")
+        f.write("   - Evaluated on test set (unseen during training)\n\n")
+        
+        f.write("## 📈 Metrics Explained\n\n")
+        f.write("### MS MARCO\n")
+        f.write("- **MRR@10**: Mean Reciprocal Rank at 10\n")
+        f.write("- **Recall@100**: Recall at 100 documents\n")
+        f.write("- **nDCG@10**: Normalized Discounted Cumulative Gain at 10\n\n")
+        
+        f.write("### BEIR Datasets\n")
+        f.write("- **nDCG@10**: Primary metric (ranking quality)\n")
+        f.write("- **Recall@100**: Coverage metric\n\n")
+        
+        f.write("## 🔍 How to Use\n\n")
+        f.write("1. **Quick Overview**: Read `tier1_complete_benchmark_*.txt`\n")
+        f.write("2. **Detailed Analysis**: Parse `tier1_complete_benchmark_*.json`\n")
+        f.write("3. **Per-Dataset**: Check individual `*_results.json` files\n")
+        f.write("4. **Load Models**: See checkpoints in `checkpoints/tier1/`\n\n")
+        
+        f.write("## 📊 Understanding Improvements\n\n")
+        f.write("Each result includes two types of improvements:\n\n")
+        f.write("- **Absolute**: Direct metric difference\n")
+        f.write("  - Example: `0.0544` means 5.44 percentage points improvement\n\n")
+        f.write("- **Relative %**: Percentage improvement over baseline\n")
+        f.write("  - Example: `16.76%` means 16.76% better than baseline\n")
+        f.write("  - Formula: `(new - old) / old × 100`\n\n")
+        
+        f.write("## ✅ Data Isolation Guarantee\n\n")
+        f.write("All evaluations follow proper ML practices:\n")
+        f.write("- **Training**: Uses ONLY training set\n")
+        f.write("- **Validation**: Uses ONLY validation set (for early stopping)\n")
+        f.write("- **Testing**: Uses ONLY test set (completely unseen during training)\n")
+        f.write("- **No data leakage** between splits\n\n")
+        
+        f.write("## 📚 Citation\n\n")
+        f.write("If you use these results, please cite:\n")
+        f.write("```\n")
+        f.write("Multi-Attention-Weight Transformers for Information Retrieval\n")
+        f.write("Tier-1 Evaluation following SIGIR/WWW/WSDM/NeurIPS standards\n")
+        f.write("```\n")
+    
+    print(f"📖 Created results README: {readme_path}")
+
+
+def create_checkpoint_readme(checkpoint_dir: Path):
+    """Create a README explaining the checkpoint structure"""
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    readme_path = checkpoint_dir / "README_CHECKPOINTS.md"
+    
+    with open(readme_path, 'w') as f:
+        f.write("# Model Checkpoints\n\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        f.write("## 📁 Folder Structure\n\n")
+        f.write("```\n")
+        f.write("checkpoints/tier1/\n")
+        f.write("├── README_CHECKPOINTS.md              # This file\n")
+        f.write("├── MS_MARCO/                          # Dataset-specific checkpoints\n")
+        f.write("│   ├── supervised/                    # LoRA supervised model\n")
+        f.write("│   │   ├── best_model.pt             # Best checkpoint (highest validation nDCG@10)\n")
+        f.write("│   │   ├── latest.pt                 # Latest checkpoint (for resuming)\n")
+        f.write("│   │   ├── BEST_epoch003_nDCG0.4532_20250101_120000.pt\n")
+        f.write("│   │   └── epoch002_nDCG0.4401_20250101_115500.pt\n")
+        f.write("│   └── maw/                          # MAW model\n")
+        f.write("│       ├── best_model.pt\n")
+        f.write("│       ├── latest.pt\n")
+        f.write("│       └── BEST_epoch004_nDCG0.4755_20250101_121000.pt\n")
+        f.write("├── BEIR_Natural_Questions/\n")
+        f.write("│   ├── supervised/\n")
+        f.write("│   │   └── ...\n")
+        f.write("│   └── maw/\n")
+        f.write("│       └── ...\n")
+        f.write("├── BEIR_HotpotQA/\n")
+        f.write("│   └── ...\n")
+        f.write("└── BEIR_TriviaQA/\n")
+        f.write("    └── ...\n")
+        f.write("```\n\n")
+        
+        f.write("## 🎯 Checkpoint Organization\n\n")
+        f.write("Checkpoints are organized by:\n")
+        f.write("1. **Dataset**: Each dataset has its own folder\n")
+        f.write("2. **Model Type**: `supervised` (LoRA) or `maw` (Multi-Attention-Weight)\n")
+        f.write("3. **Checkpoint Type**:\n")
+        f.write("   - `best_model.pt`: Best performing model (highest validation nDCG@10)\n")
+        f.write("   - `latest.pt`: Most recent checkpoint (for resuming training)\n")
+        f.write("   - Timestamped files: All saved checkpoints with epoch and metric\n\n")
+        
+        f.write("## 📦 Checkpoint Contents\n\n")
+        f.write("Each checkpoint file (`.pt`) contains:\n")
+        f.write("```python\n")
+        f.write("{\n")
+        f.write("    'epoch': 3,                        # Training epoch\n")
+        f.write("    'model_state_dict': {...},         # Model weights\n")
+        f.write("    'validation_ndcg10': 0.4532,       # Validation nDCG@10\n")
+        f.write("    'config': Tier1Config(...),        # Complete configuration\n")
+        f.write("    'dataset_name': 'MS MARCO',        # Dataset name\n")
+        f.write("    'model_type': 'supervised',        # Model type\n")
+        f.write("    'timestamp': '20250101_120000',    # Save timestamp\n")
+        f.write("    'is_best': True                    # Whether this is the best checkpoint\n")
+        f.write("}\n")
+        f.write("```\n\n")
+        
+        f.write("## 🔄 Loading Checkpoints\n\n")
+        f.write("```python\n")
+        f.write("import torch\n")
+        f.write("from tier_1 import BaselineRetriever, MAWRetriever, Tier1Config\n\n")
+        
+        f.write("# Load a checkpoint\n")
+        f.write("checkpoint = torch.load('checkpoints/tier1/MS_MARCO/maw/best_model.pt')\n\n")
+        
+        f.write("# Extract configuration and create model\n")
+        f.write("config = checkpoint['config']\n")
+        f.write("if checkpoint['model_type'] == 'maw':\n")
+        f.write("    model = MAWRetriever(config)\n")
+        f.write("else:\n")
+        f.write("    model = BaselineRetriever(config)\n\n")
+        
+        f.write("# Load weights\n")
+        f.write("model.load_state_dict(checkpoint['model_state_dict'])\n")
+        f.write("model.eval()  # Set to evaluation mode\n\n")
+        
+        f.write("# Check performance\n")
+        f.write("print(f\"Validation nDCG@10: {checkpoint['validation_ndcg10']:.4f}\")\n")
+        f.write("print(f\"Epoch: {checkpoint['epoch']}\")\n")
+        f.write("print(f\"Dataset: {checkpoint['dataset_name']}\")\n")
+        f.write("```\n\n")
+        
+        f.write("## 📊 Checkpoint Naming Convention\n\n")
+        f.write("Checkpoint filenames follow this pattern:\n")
+        f.write("```\n")
+        f.write("[BEST_]epoch{epoch:03d}_nDCG{metric:.4f}_{timestamp}.pt\n")
+        f.write("```\n\n")
+        
+        f.write("Examples:\n")
+        f.write("- `BEST_epoch003_nDCG0.4532_20250101_120000.pt`\n")
+        f.write("  - **BEST**: This is the best checkpoint\n")
+        f.write("  - **epoch003**: Saved at epoch 3\n")
+        f.write("  - **nDCG0.4532**: Validation nDCG@10 = 0.4532\n")
+        f.write("  - **20250101_120000**: Saved on Jan 1, 2025 at 12:00:00\n\n")
+        
+        f.write("- `epoch002_nDCG0.4401_20250101_115500.pt`\n")
+        f.write("  - Regular checkpoint (not the best)\n")
+        f.write("  - Saved at epoch 2 with nDCG@10 = 0.4401\n\n")
+        
+        f.write("## 💡 Best Practices\n\n")
+        f.write("1. **Use `best_model.pt`** for evaluation and deployment\n")
+        f.write("2. **Use `latest.pt`** to resume interrupted training\n")
+        f.write("3. **Keep timestamped checkpoints** to track training progress\n")
+        f.write("4. **Check validation_ndcg10** to compare model performance\n\n")
+        
+        f.write("## 🚀 Quick Start\n\n")
+        f.write("Load the best MAW model for MS MARCO:\n")
+        f.write("```python\n")
+        f.write("checkpoint = torch.load('checkpoints/tier1/MS_MARCO/maw/best_model.pt')\n")
+        f.write("model = MAWRetriever(checkpoint['config'])\n")
+        f.write("model.load_state_dict(checkpoint['model_state_dict'])\n")
+        f.write("model.eval()\n")
+        f.write("```\n\n")
+        
+        f.write("## ⚠️ Important Notes\n\n")
+        f.write("- Checkpoints are saved during training with early stopping\n")
+        f.write("- Only checkpoints from validation improvements are marked as BEST\n")
+        f.write("- All checkpoints include complete configuration for reproducibility\n")
+        f.write("- Test set is NEVER used during training (proper data isolation)\n")
+    
+    print(f"📖 Created checkpoint README: {readme_path}")
 
 
 def main():
