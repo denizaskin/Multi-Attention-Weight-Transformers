@@ -2126,9 +2126,9 @@ def run_complete_benchmark(config: Tier1Config):
             'venue': 'MSFT/TREC',
             'primary_metrics': ['MRR@1000', 'nDCG@10', 'Recall@100'],  # Primary metrics for display
             'all_metrics': TIER1_METRICS,  # All comprehensive metrics
-            'train_size': config.train_samples or 2000,
-            'val_size': config.val_samples or 500,
-            'test_size': config.test_samples or 1000,
+            'train_size': config.train_samples,  # None = use entire dataset
+            'val_size': config.val_samples,      # None = use entire dataset
+            'test_size': config.test_samples,    # None = use entire dataset
         },
         {
             'name': 'BEIR Natural Questions',
@@ -2136,9 +2136,9 @@ def run_complete_benchmark(config: Tier1Config):
             'venue': 'TACL 2019',
             'primary_metrics': ['nDCG@10', 'Recall@100', 'Precision@10'],  # Primary metrics for display
             'all_metrics': TIER1_METRICS,  # All comprehensive metrics
-            'train_size': config.train_samples or 2000,
-            'val_size': config.val_samples or 500,
-            'test_size': config.test_samples or 1000,
+            'train_size': config.train_samples,  # None = use entire dataset
+            'val_size': config.val_samples,      # None = use entire dataset
+            'test_size': config.test_samples,    # None = use entire dataset
         },
         {
             'name': 'BEIR HotpotQA',
@@ -2146,9 +2146,9 @@ def run_complete_benchmark(config: Tier1Config):
             'venue': 'EMNLP 2018',
             'primary_metrics': ['nDCG@10', 'Recall@100', 'Precision@10'],  # Primary metrics for display
             'all_metrics': TIER1_METRICS,  # All comprehensive metrics
-            'train_size': config.train_samples or 2000,
-            'val_size': config.val_samples or 500,
-            'test_size': config.test_samples or 1000,
+            'train_size': config.train_samples,  # None = use entire dataset
+            'val_size': config.val_samples,      # None = use entire dataset
+            'test_size': config.test_samples,    # None = use entire dataset
         },
         {
             'name': 'BEIR TriviaQA',
@@ -2156,9 +2156,9 @@ def run_complete_benchmark(config: Tier1Config):
             'venue': 'EMNLP 2017',
             'primary_metrics': ['nDCG@10', 'Recall@100', 'Precision@10'],  # Primary metrics for display
             'all_metrics': TIER1_METRICS,  # All comprehensive metrics
-            'train_size': config.train_samples or 2000,
-            'val_size': config.val_samples or 500,
-            'test_size': config.test_samples or 1000,
+            'train_size': config.train_samples,  # None = use entire dataset
+            'val_size': config.val_samples,      # None = use entire dataset
+            'test_size': config.test_samples,    # None = use entire dataset
         },
     ]
     
@@ -2618,6 +2618,188 @@ def run_complete_benchmark(config: Tier1Config):
             json.dump(all_results, f, indent=2)
         print(f"💾 Saved complete results: {json_path}")
     
+    # ==================================================================================
+    # CREATE BEST_RESULTS.json - Summary of best results per dataset per method
+    # ==================================================================================
+    
+    best_results = {
+        'metadata': {
+            'benchmark_name': 'TIER-1 Multi-Attention-Weight Transformers Evaluation',
+            'generated_at': datetime.now().isoformat(),
+            'timestamp': timestamp,
+            'total_datasets': len(all_results['datasets']),
+            'methods_per_dataset': 3,
+            'description': 'Best results for each dataset and method with hyperparameters'
+        },
+        'global_configuration': {
+            'seed': config.seed,
+            'num_layers': config.num_layers,
+            'hidden_dim': config.hidden_dim,
+            'num_heads': config.num_heads,
+            'depth_dim': config.depth_dim,
+        },
+        'datasets': {}
+    }
+    
+    # Extract best results for each dataset
+    for dataset_name, dataset_data in all_results['datasets'].items():
+        results = dataset_data['results']
+        dataset_info = dataset_data['dataset_info']
+        
+        best_results['datasets'][dataset_name] = {
+            'dataset_info': {
+                'name': dataset_name,
+                'type': dataset_info['type'],
+                'venue': dataset_info['venue'],
+                'train_size': dataset_info['train_size'],
+                'val_size': dataset_info['val_size'],
+                'test_size': dataset_info['test_size']
+            },
+            'methods': {}
+        }
+        
+        # Method 1: Zero-shot
+        if results['zeroshot']:
+            best_results['datasets'][dataset_name]['methods']['zero_shot'] = {
+                'method_name': 'Zero-shot Retrieval',
+                'description': 'Off-the-shelf retriever without any fine-tuning',
+                'training': 'None - No training performed',
+                'hyperparameters': {
+                    'note': 'No training - using pre-initialized weights'
+                },
+                'best_metrics': results['zeroshot'],
+                'runtime': {
+                    'seconds': results.get('zeroshot_runtime', 0),
+                    'minutes': results.get('zeroshot_runtime', 0) / 60
+                }
+            }
+        
+        # Method 2: LoRA Fine-tuned
+        if results['lora']:
+            lora_metrics = results['lora']['metrics']
+            lora_history = results['lora'].get('training_history', {})
+            
+            # Find best epoch based on validation nDCG
+            best_epoch = -1
+            best_val_ndcg = 0.0
+            if 'val_ndcg' in lora_history and lora_history['val_ndcg']:
+                best_val_ndcg = max(lora_history['val_ndcg'])
+                best_epoch = lora_history['val_ndcg'].index(best_val_ndcg) + 1
+            
+            best_results['datasets'][dataset_name]['methods']['lora_fine_tuned'] = {
+                'method_name': 'LoRA Fine-tuned Retrieval',
+                'description': 'Parameter-efficient fine-tuning using LoRA adapters',
+                'training': 'LoRA adapters trained on last layer',
+                'hyperparameters': {
+                    'use_lora': True,
+                    'lora_rank': 8,
+                    'lora_alpha': 16,
+                    'num_epochs': config.num_epochs,
+                    'batch_size': config.batch_size,
+                    'eval_batch_size': config.eval_batch_size,
+                    'learning_rate': config.learning_rate,
+                    'warmup_steps': config.warmup_steps,
+                    'gradient_accumulation_steps': config.gradient_accumulation_steps,
+                    'max_grad_norm': config.max_grad_norm,
+                    'best_epoch': best_epoch,
+                    'best_validation_ndcg10': best_val_ndcg,
+                    'trainable_parameters': 'LoRA adapters only (~thousands of parameters)'
+                },
+                'training_history': lora_history,
+                'best_metrics': lora_metrics,
+                'runtime': {
+                    'seconds': results['lora'].get('runtime', 0),
+                    'minutes': results['lora'].get('runtime', 0) / 60
+                },
+                'improvements_vs_zeroshot': {}
+            }
+            
+            # Add improvements vs zero-shot
+            if results['zeroshot']:
+                for metric, value in lora_metrics.items():
+                    if metric in results['zeroshot']:
+                        zeroshot_val = results['zeroshot'][metric]
+                        abs_imp = value - zeroshot_val
+                        rel_imp = (abs_imp / zeroshot_val * 100) if zeroshot_val > 0 else 0
+                        best_results['datasets'][dataset_name]['methods']['lora_fine_tuned']['improvements_vs_zeroshot'][metric] = {
+                            'absolute': abs_imp,
+                            'relative_percent': rel_imp
+                        }
+        
+        # Method 3: MAW Fine-tuned
+        if results['maw']:
+            maw_metrics = results['maw']['metrics']
+            maw_history = results['maw'].get('training_history', {})
+            
+            # Find best epoch based on validation nDCG
+            best_epoch = -1
+            best_val_ndcg = 0.0
+            if 'val_ndcg' in maw_history and maw_history['val_ndcg']:
+                best_val_ndcg = max(maw_history['val_ndcg'])
+                best_epoch = maw_history['val_ndcg'].index(best_val_ndcg) + 1
+            
+            best_results['datasets'][dataset_name]['methods']['maw_fine_tuned'] = {
+                'method_name': 'MAW Fine-tuned Retrieval',
+                'description': 'Multi-Attention-Weight architecture with GRPO router and selective layer fine-tuning',
+                'training': 'Last layer + GRPO router fine-tuned',
+                'hyperparameters': {
+                    'architecture': 'MAW (Multi-Attention-Weight)',
+                    'maw_layers': config.maw_layers,
+                    'finetune_layers': [config.num_layers],
+                    'depth_dim': config.depth_dim,
+                    'grpo_enabled': True,
+                    'num_epochs': config.num_epochs,
+                    'batch_size': config.batch_size,
+                    'eval_batch_size': config.eval_batch_size,
+                    'learning_rate': config.learning_rate,
+                    'warmup_steps': config.warmup_steps,
+                    'gradient_accumulation_steps': config.gradient_accumulation_steps,
+                    'max_grad_norm': config.max_grad_norm,
+                    'best_epoch': best_epoch,
+                    'best_validation_ndcg10': best_val_ndcg,
+                    'trainable_parameters': 'Full last layer + GRPO router (~millions of parameters)'
+                },
+                'training_history': maw_history,
+                'best_metrics': maw_metrics,
+                'runtime': {
+                    'seconds': results['maw'].get('runtime', 0),
+                    'minutes': results['maw'].get('runtime', 0) / 60
+                },
+                'improvements_vs_zeroshot': {},
+                'improvements_vs_lora': {}
+            }
+            
+            # Add improvements vs zero-shot
+            if results['zeroshot']:
+                for metric, value in maw_metrics.items():
+                    if metric in results['zeroshot']:
+                        zeroshot_val = results['zeroshot'][metric]
+                        abs_imp = value - zeroshot_val
+                        rel_imp = (abs_imp / zeroshot_val * 100) if zeroshot_val > 0 else 0
+                        best_results['datasets'][dataset_name]['methods']['maw_fine_tuned']['improvements_vs_zeroshot'][metric] = {
+                            'absolute': abs_imp,
+                            'relative_percent': rel_imp
+                        }
+            
+            # Add improvements vs LoRA
+            if results['lora']:
+                lora_metrics = results['lora']['metrics']
+                for metric, value in maw_metrics.items():
+                    if metric in lora_metrics:
+                        lora_val = lora_metrics[metric]
+                        abs_imp = value - lora_val
+                        rel_imp = (abs_imp / lora_val * 100) if lora_val > 0 else 0
+                        best_results['datasets'][dataset_name]['methods']['maw_fine_tuned']['improvements_vs_lora'][metric] = {
+                            'absolute': abs_imp,
+                            'relative_percent': rel_imp
+                        }
+    
+    # Save BEST_RESULTS.json
+    best_results_path = log_dir / "BEST_RESULTS.json"
+    with open(best_results_path, 'w') as f:
+        json.dump(best_results, f, indent=2)
+    print(f"🏆 Saved best results summary: {best_results_path}")
+    
     # Cleanup old log files if limit is set
     if config.max_log_files > 0:
         cleanup_old_log_files(log_dir, config.max_log_files, config.compress_logs)
@@ -2734,6 +2916,7 @@ def run_complete_benchmark(config: Tier1Config):
     print(f"{'='*100}\n")
     
     print(f"📊 RESULTS SAVED:")
+    print(f"   🏆 BEST_RESULTS.json       # Best results per dataset per method with hyperparameters")
     print(f"   Complete JSON:  {json_path}")
     print(f"   Summary TXT:    {txt_path}")
     print(f"   Documentation:  {log_dir / 'README_RESULTS.md'}")
@@ -2863,6 +3046,7 @@ def create_output_readme(log_dir: Path, timestamp: str):
         f.write("```\n")
         f.write("logs/tier1/\n")
         f.write("├── README_RESULTS.md                          # This file\n")
+        f.write("├── BEST_RESULTS.json                          # 🏆 Best results per dataset per method\n")
         f.write("├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.json  # Complete results (all datasets)\n")
         f.write("├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.txt   # Human-readable summary\n")
         f.write("├── ms_marco_results.json                      # Per-dataset results\n")
@@ -2872,6 +3056,19 @@ def create_output_readme(log_dir: Path, timestamp: str):
         f.write("```\n\n")
         
         f.write("## 📊 File Descriptions\n\n")
+        f.write("### 🏆 BEST_RESULTS.json (★ START HERE)\n")
+        f.write("**The most important file** - Contains best results for each dataset and method:\n")
+        f.write("- **Zero-shot**: Best metrics (no training)\n")
+        f.write("- **LoRA Fine-tuned**: Best metrics + hyperparameters + training history\n")
+        f.write("- **MAW Fine-tuned**: Best metrics + hyperparameters + training history\n")
+        f.write("- **Improvements**: Absolute and relative improvements for all metrics\n")
+        f.write("- **Metadata**: Timestamp, configuration, dataset info\n\n")
+        f.write("**Use this file for:**\n")
+        f.write("- Quick comparison of all methods\n")
+        f.write("- Understanding hyperparameters used for training\n")
+        f.write("- Reproducing results (all settings included)\n")
+        f.write("- Analyzing improvements across datasets\n\n")
+        
         f.write("### Complete Benchmark Files\n")
         f.write("- **`tier1_complete_benchmark_*.json`**: Complete results for all datasets\n")
         f.write("  - Contains configuration, all metrics, training history\n")
@@ -3078,14 +3275,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Default run (click "Run" button or run with no arguments)
+  # Default run - uses ENTIRE dataset (click "Run" button or run with no arguments)
   python tier_1.py
   
   # Quick test with small dataset
-  python tier_1.py --train-samples 100 --val-samples 50 --test-samples 100 --num-epochs 3
+  python tier_1.py --train-samples 500 --val-samples 200 --test-samples 500 --num-epochs 3
   
-  # Full evaluation with 6-layer model
-  python tier_1.py --num-layers 6 --maw-layers "5,6" --train-samples 5000 --num-epochs 15
+  # Medium size evaluation
+  python tier_1.py --train-samples 2000 --val-samples 500 --test-samples 1000 --num-epochs 10
   
   # Ablation: MAW on all layers
   python tier_1.py --num-layers 6 --maw-layers "all" --num-epochs 10
@@ -3122,12 +3319,12 @@ Examples:
                        help='Warmup steps (1000 standard in DPR)')
     
     # Dataset settings (following BEIR/MS MARCO evaluation protocols)
-    parser.add_argument('--train-samples', type=int, default=2000,
-                       help='Number of training samples (None for full dataset)')
-    parser.add_argument('--val-samples', type=int, default=500,
-                       help='Number of validation samples')
-    parser.add_argument('--test-samples', type=int, default=1000,
-                       help='Number of test samples')
+    parser.add_argument('--train-samples', type=int, default=None,
+                       help='Number of training samples (None = use entire dataset)')
+    parser.add_argument('--val-samples', type=int, default=None,
+                       help='Number of validation samples (None = use entire dataset)')
+    parser.add_argument('--test-samples', type=int, default=None,
+                       help='Number of test samples (None = use entire dataset)')
     
     # Evaluation settings (standard k-values from TREC/BEIR)
     parser.add_argument('--k-values', type=str, default='1,5,10,20,100,1000',
