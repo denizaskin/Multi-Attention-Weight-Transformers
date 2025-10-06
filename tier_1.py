@@ -2036,8 +2036,8 @@ def run_complete_benchmark(config: Tier1Config):
     
     For each dataset, runs:
     1. Zero-shot retrieval (no training)
-    2. Supervised fine-tuned retrieval
-    3. MAW fine-tuned retrieval
+    2. LoRA fine-tuned retrieval (parameter-efficient fine-tuning)
+    3. MAW fine-tuned retrieval (Multi-Attention-Weight architecture)
     
     Follows Tier-1 standards from SIGIR, WWW, WSDM, NeurIPS
     
@@ -2226,76 +2226,101 @@ def run_complete_benchmark(config: Tier1Config):
         print(f"{'APPROACH 1: ZERO-SHOT RETRIEVAL (No Training)':^100}")
         print(f"{'-'*100}\n")
         
+        # Start timing
+        zeroshot_start_time = time.time()
+        
         zeroshot_config = Tier1Config(
             hidden_dim=config.hidden_dim,
             num_heads=config.num_heads,
             num_layers=config.num_layers,
             seed=config.seed,
             eval_batch_size=config.eval_batch_size,
-            k_values=config.k_values
+            k_values=config.k_values,
+            use_multi_gpu=config.use_multi_gpu  # Inherit multi-GPU setting for evaluation
         )
         zeroshot_model = BaselineRetriever(zeroshot_config).to(device)
         
         zeroshot_results = evaluate_retriever(
             zeroshot_model, test_dict, zeroshot_config, device, split='test'
         )
+        
+        # End timing
+        zeroshot_end_time = time.time()
+        zeroshot_runtime = zeroshot_end_time - zeroshot_start_time
+        
         dataset_results['zeroshot'] = zeroshot_results
+        dataset_results['zeroshot_runtime'] = zeroshot_runtime
         
         print(f"✅ Zero-shot results (primary metrics):")
         for metric in dataset_info['primary_metrics']:
             if metric in zeroshot_results:
                 print(f"   {metric}: {zeroshot_results[metric]:.4f}")
         print(f"   (+ {len(zeroshot_results)} total TIER-1 metrics computed)")
+        print(f"   ⏱️  Runtime: {zeroshot_runtime:.2f} seconds ({zeroshot_runtime/60:.2f} minutes)")
         
         # ==============================================================================
-        # 2. SUPERVISED FINE-TUNED RETRIEVAL
+        # 2. LORA FINE-TUNED RETRIEVAL
         # ==============================================================================
         
         if train_dict is not None:
             print(f"\n{'-'*100}")
-            print(f"{'APPROACH 2: SUPERVISED FINE-TUNED RETRIEVAL':^100}")
+            print(f"{'APPROACH 2: LORA FINE-TUNED RETRIEVAL':^100}")
             print(f"{'-'*100}\n")
             
-            supervised_config = Tier1Config(
+            # Start timing
+            lora_start_time = time.time()
+            
+            lora_config = Tier1Config(
                 hidden_dim=config.hidden_dim,
                 num_heads=config.num_heads,
                 num_layers=config.num_layers,
-                finetune_layers=[config.num_layers],  # Fine-tune last layer
+                use_lora=True,  # Enable LoRA fine-tuning
+                lora_rank=8,
+                lora_alpha=16,
                 num_epochs=config.num_epochs,
                 batch_size=config.batch_size,
                 learning_rate=config.learning_rate,
                 seed=config.seed,
                 eval_batch_size=config.eval_batch_size,
-                k_values=config.k_values
+                k_values=config.k_values,
+                use_multi_gpu=config.use_multi_gpu,  # Inherit multi-GPU setting
+                gradient_accumulation_steps=config.gradient_accumulation_steps
             )
-            supervised_model = BaselineRetriever(supervised_config).to(device)
+            lora_model = BaselineRetriever(lora_config).to(device)
             
             # Train on train set only
             train_history = train_retriever(
-                supervised_model, train_dict, val_dict, supervised_config, device,
+                lora_model, train_dict, val_dict, lora_config, device,
                 dataset_name=dataset_name,
-                model_type='supervised'
+                model_type='lora'
             )
             
             # Evaluate on test set
-            supervised_results = evaluate_retriever(
-                supervised_model, test_dict, supervised_config, device, split='test'
+            lora_results = evaluate_retriever(
+                lora_model, test_dict, lora_config, device, split='test'
             )
-            dataset_results['supervised'] = {
-                'metrics': supervised_results,
-                'training_history': train_history
+            
+            # End timing
+            lora_end_time = time.time()
+            lora_runtime = lora_end_time - lora_start_time
+            
+            dataset_results['lora'] = {
+                'metrics': lora_results,
+                'training_history': train_history,
+                'runtime': lora_runtime
             }
             
-            print(f"✅ Supervised fine-tuned results (primary metrics):")
+            print(f"✅ LoRA fine-tuned results (primary metrics):")
             for metric in dataset_info['primary_metrics']:
-                if metric in supervised_results:
-                    print(f"   {metric}: {supervised_results[metric]:.4f}")
-            print(f"   (+ {len(supervised_results)} total TIER-1 metrics computed)")
+                if metric in lora_results:
+                    print(f"   {metric}: {lora_results[metric]:.4f}")
+            print(f"   (+ {len(lora_results)} total TIER-1 metrics computed)")
+            print(f"   ⏱️  Runtime: {lora_runtime:.2f} seconds ({lora_runtime/60:.2f} minutes)")
         else:
             print(f"\n{'-'*100}")
-            print(f"⚠️  No training data available for {dataset_name} - Skipping supervised fine-tuning")
+            print(f"⚠️  No training data available for {dataset_name} - Skipping LoRA fine-tuning")
             print(f"{'-'*100}\n")
-            dataset_results['supervised'] = None
+            dataset_results['lora'] = None
         
         # ==============================================================================
         # 3. MAW FINE-TUNED RETRIEVAL
@@ -2305,6 +2330,9 @@ def run_complete_benchmark(config: Tier1Config):
             print(f"\n{'-'*100}")
             print(f"{'APPROACH 3: MAW FINE-TUNED RETRIEVAL':^100}")
             print(f"{'-'*100}\n")
+            
+            # Start timing
+            maw_start_time = time.time()
             
             maw_config = Tier1Config(
                 hidden_dim=config.hidden_dim,
@@ -2318,7 +2346,9 @@ def run_complete_benchmark(config: Tier1Config):
                 learning_rate=config.learning_rate,
                 seed=config.seed,
                 eval_batch_size=config.eval_batch_size,
-                k_values=config.k_values
+                k_values=config.k_values,
+                use_multi_gpu=config.use_multi_gpu,  # Inherit multi-GPU setting
+                gradient_accumulation_steps=config.gradient_accumulation_steps
             )
             maw_model = MAWRetriever(maw_config).to(device)
             
@@ -2333,9 +2363,15 @@ def run_complete_benchmark(config: Tier1Config):
             maw_results = evaluate_retriever(
                 maw_model, test_dict, maw_config, device, split='test'
             )
+            
+            # End timing
+            maw_end_time = time.time()
+            maw_runtime = maw_end_time - maw_start_time
+            
             dataset_results['maw'] = {
                 'metrics': maw_results,
-                'training_history': train_history
+                'training_history': train_history,
+                'runtime': maw_runtime
             }
             
             print(f"✅ MAW fine-tuned results (primary metrics):")
@@ -2343,6 +2379,7 @@ def run_complete_benchmark(config: Tier1Config):
                 if metric in maw_results:
                     print(f"   {metric}: {maw_results[metric]:.4f}")
             print(f"   (+ {len(maw_results)} total TIER-1 metrics computed)")
+            print(f"   ⏱️  Runtime: {maw_runtime:.2f} seconds ({maw_runtime/60:.2f} minutes)")
         else:
             print(f"\n{'-'*100}")
             print(f"⚠️  No training data available for {dataset_name} - Skipping MAW fine-tuning")
@@ -2365,26 +2402,26 @@ def run_complete_benchmark(config: Tier1Config):
         metrics_str = ' | '.join([f"{zeroshot_results.get(m, 0.0):.4f}" for m in dataset_info['primary_metrics']])
         print(f"{'Zero-shot (No Training)':<30} {'|':^5} {metrics_str}")
         
-        # Supervised
-        if dataset_results['supervised']:
-            supervised_metrics = dataset_results['supervised']['metrics']
-            metrics_str = ' | '.join([f"{supervised_metrics.get(m, 0.0):.4f}" for m in dataset_info['primary_metrics']])
+        # LoRA Fine-tuned
+        if dataset_results['lora']:
+            lora_metrics = dataset_results['lora']['metrics']
+            metrics_str = ' | '.join([f"{lora_metrics.get(m, 0.0):.4f}" for m in dataset_info['primary_metrics']])
             # Calculate improvement for primary metric (first in list)
             primary_metric = dataset_info['primary_metrics'][0]
-            if primary_metric in zeroshot_results and primary_metric in supervised_metrics:
-                abs_improvement = supervised_metrics[primary_metric] - zeroshot_results[primary_metric]
+            if primary_metric in zeroshot_results and primary_metric in lora_metrics:
+                abs_improvement = lora_metrics[primary_metric] - zeroshot_results[primary_metric]
                 rel_improvement = (abs_improvement / zeroshot_results[primary_metric] * 100) if zeroshot_results[primary_metric] > 0 else 0
-                print(f"{'Supervised Fine-tuned':<30} {'|':^5} {metrics_str}  (Δ {primary_metric}: {abs_improvement:+.4f} / {rel_improvement:+.2f}%)")
+                print(f"{'LoRA Fine-tuned':<30} {'|':^5} {metrics_str}  (Δ {primary_metric}: {abs_improvement:+.4f} / {rel_improvement:+.2f}%)")
             else:
-                print(f"{'Supervised Fine-tuned':<30} {'|':^5} {metrics_str}")
+                print(f"{'LoRA Fine-tuned':<30} {'|':^5} {metrics_str}")
         else:
-            print(f"{'Supervised Fine-tuned':<30} {'|':^5} N/A (No training data)")
+            print(f"{'LoRA Fine-tuned':<30} {'|':^5} N/A (No training data)")
         
         # MAW
         if dataset_results['maw']:
             maw_metrics = dataset_results['maw']['metrics']
             metrics_str = ' | '.join([f"{maw_metrics.get(m, 0.0):.4f}" for m in dataset_info['primary_metrics']])
-            # Calculate improvement vs zero-shot and vs supervised
+            # Calculate improvement vs zero-shot and vs LoRA
             primary_metric = dataset_info['primary_metrics'][0]
             if primary_metric in zeroshot_results and primary_metric in maw_metrics:
                 abs_improvement = maw_metrics[primary_metric] - zeroshot_results[primary_metric]
@@ -2393,18 +2430,35 @@ def run_complete_benchmark(config: Tier1Config):
             else:
                 print(f"{'MAW Fine-tuned':<30} {'|':^5} {metrics_str}")
             
-            # Show MAW vs Supervised comparison
-            if dataset_results['supervised']:
-                supervised_metrics = dataset_results['supervised']['metrics']
-                if primary_metric in supervised_metrics and primary_metric in maw_metrics:
-                    abs_improvement_vs_sup = maw_metrics[primary_metric] - supervised_metrics[primary_metric]
-                rel_improvement_vs_sup = (abs_improvement_vs_sup / supervised_metrics[primary_metric] * 100) if supervised_metrics[primary_metric] > 0 else 0
-                print(f"{'  → MAW vs Supervised':<30} {'':^5} {'':<50}  (Δ {primary_metric}: {abs_improvement_vs_sup:+.4f} / {rel_improvement_vs_sup:+.2f}%)")
+            # Show MAW vs LoRA comparison
+            if dataset_results['lora']:
+                lora_metrics = dataset_results['lora']['metrics']
+                if primary_metric in lora_metrics and primary_metric in maw_metrics:
+                    abs_improvement_vs_lora = maw_metrics[primary_metric] - lora_metrics[primary_metric]
+                    rel_improvement_vs_lora = (abs_improvement_vs_lora / lora_metrics[primary_metric] * 100) if lora_metrics[primary_metric] > 0 else 0
+                    print(f"{'  → MAW vs LoRA':<30} {'':^5} {'':<50}  (Δ {primary_metric}: {abs_improvement_vs_lora:+.4f} / {rel_improvement_vs_lora:+.2f}%)")
         else:
             print(f"{'MAW Fine-tuned':<30} {'|':^5} N/A (No training data)")
         
         print(f"{'='*100}")
         print(f"📊 Note: All {len(TIER1_METRICS)} comprehensive TIER-1 metrics computed and saved to JSON")
+        print(f"{'='*100}\n")
+        
+        # Runtime Summary
+        print(f"⏱️  Runtime Summary:")
+        print(f"   Zero-shot:       {zeroshot_runtime:.2f}s ({zeroshot_runtime/60:.2f} min)")
+        if dataset_results['lora']:
+            lora_runtime = dataset_results['lora']['runtime']
+            print(f"   LoRA Fine-tuned: {lora_runtime:.2f}s ({lora_runtime/60:.2f} min)")
+        if dataset_results['maw']:
+            maw_runtime = dataset_results['maw']['runtime']
+            print(f"   MAW Fine-tuned:  {maw_runtime:.2f}s ({maw_runtime/60:.2f} min)")
+        total_dataset_runtime = zeroshot_runtime
+        if dataset_results['lora']:
+            total_dataset_runtime += dataset_results['lora']['runtime']
+        if dataset_results['maw']:
+            total_dataset_runtime += dataset_results['maw']['runtime']
+        print(f"   Total (dataset): {total_dataset_runtime:.2f}s ({total_dataset_runtime/60:.2f} min)")
         print(f"{'='*100}\n")
         
         # ==============================================================================
@@ -2435,38 +2489,51 @@ def run_complete_benchmark(config: Tier1Config):
                 '1_normal_retriever': {
                     'approach': 'Zero-shot (No Training)',
                     'description': 'Off-the-shelf retriever without any fine-tuning',
-                    'metrics': zeroshot_results
+                    'metrics': zeroshot_results,
+                    'runtime_seconds': zeroshot_runtime,
+                    'runtime_minutes': zeroshot_runtime / 60
                 },
-                '2_lora_supervised_retriever': {
-                    'approach': 'LoRA Supervised Fine-tuned',
-                    'description': 'Baseline retriever with LoRA fine-tuning on supervised data',
-                    'metrics': dataset_results['supervised']['metrics'] if dataset_results['supervised'] else None,
-                    'training_history': dataset_results['supervised']['training_history'] if dataset_results['supervised'] else None
+                '2_lora_fine_tuned_retriever': {
+                    'approach': 'LoRA Fine-tuned',
+                    'description': 'Baseline retriever with LoRA adapters fine-tuned on supervised data (parameter-efficient)',
+                    'metrics': dataset_results['lora']['metrics'] if dataset_results['lora'] else None,
+                    'training_history': dataset_results['lora']['training_history'] if dataset_results['lora'] else None,
+                    'runtime_seconds': dataset_results['lora']['runtime'] if dataset_results['lora'] else None,
+                    'runtime_minutes': dataset_results['lora']['runtime'] / 60 if dataset_results['lora'] else None
                 },
-                '3_maw_supervised_retriever': {
+                '3_maw_fine_tuned_retriever': {
                     'approach': 'MAW Fine-tuned (GRPO on last layer)',
                     'description': 'MAW retriever with selective layer fine-tuning and GRPO attention',
                     'metrics': dataset_results['maw']['metrics'] if dataset_results['maw'] else None,
-                    'training_history': dataset_results['maw']['training_history'] if dataset_results['maw'] else None
+                    'training_history': dataset_results['maw']['training_history'] if dataset_results['maw'] else None,
+                    'runtime_seconds': dataset_results['maw']['runtime'] if dataset_results['maw'] else None,
+                    'runtime_minutes': dataset_results['maw']['runtime'] / 60 if dataset_results['maw'] else None
                 }
+            },
+            'runtime_summary': {
+                'zeroshot_seconds': zeroshot_runtime,
+                'lora_seconds': dataset_results['lora']['runtime'] if dataset_results['lora'] else None,
+                'maw_seconds': dataset_results['maw']['runtime'] if dataset_results['maw'] else None,
+                'total_dataset_seconds': total_dataset_runtime,
+                'total_dataset_minutes': total_dataset_runtime / 60
             },
             'improvements': {}
         }
         
         # Calculate improvements for ALL metrics
-        if dataset_results['supervised']:
-            supervised_metrics = dataset_results['supervised']['metrics']
+        if dataset_results['lora']:
+            lora_metrics = dataset_results['lora']['metrics']
             # Calculate for all metrics in the results
-            for metric in supervised_metrics.keys():
+            for metric in lora_metrics.keys():
                 if metric in zeroshot_results:
-                    dataset_json['improvements'][f'supervised_vs_zeroshot_{metric}'] = {
-                        'absolute': supervised_metrics[metric] - zeroshot_results[metric],
-                        'relative_pct': ((supervised_metrics[metric] - zeroshot_results[metric]) / zeroshot_results[metric] * 100) if zeroshot_results[metric] > 0 else 0
+                    dataset_json['improvements'][f'lora_vs_zeroshot_{metric}'] = {
+                        'absolute': lora_metrics[metric] - zeroshot_results[metric],
+                        'relative_pct': ((lora_metrics[metric] - zeroshot_results[metric]) / zeroshot_results[metric] * 100) if zeroshot_results[metric] > 0 else 0
                     }
         
         if dataset_results['maw']:
             maw_metrics = dataset_results['maw']['metrics']
-            supervised_metrics = dataset_results['supervised']['metrics'] if dataset_results['supervised'] else {}
+            lora_metrics = dataset_results['lora']['metrics'] if dataset_results['lora'] else {}
             
             # Calculate for all metrics in the results
             for metric in maw_metrics.keys():
@@ -2477,11 +2544,11 @@ def run_complete_benchmark(config: Tier1Config):
                         'relative_pct': ((maw_metrics[metric] - zeroshot_results[metric]) / zeroshot_results[metric] * 100) if zeroshot_results[metric] > 0 else 0
                     }
                 
-                # MAW vs Supervised
-                if metric in supervised_metrics:
-                    dataset_json['improvements'][f'maw_vs_supervised_{metric}'] = {
-                        'absolute': maw_metrics[metric] - supervised_metrics[metric],
-                        'relative_pct': ((maw_metrics[metric] - supervised_metrics[metric]) / supervised_metrics[metric] * 100) if supervised_metrics[metric] > 0 else 0
+                # MAW vs LoRA
+                if metric in lora_metrics:
+                    dataset_json['improvements'][f'maw_vs_lora_{metric}'] = {
+                        'absolute': maw_metrics[metric] - lora_metrics[metric],
+                        'relative_pct': ((maw_metrics[metric] - lora_metrics[metric]) / lora_metrics[metric] * 100) if lora_metrics[metric] > 0 else 0
                     }
         
         # Save per-dataset JSON file
@@ -2514,8 +2581,8 @@ def run_complete_benchmark(config: Tier1Config):
             # Delete models to free GPU memory
             if 'zeroshot_model' in locals():
                 del zeroshot_model
-            if 'supervised_model' in locals():
-                del supervised_model
+            if 'lora_model' in locals():
+                del lora_model
             if 'maw_model' in locals():
                 del maw_model
             
@@ -2605,29 +2672,29 @@ def run_complete_benchmark(config: Tier1Config):
             else:
                 f.write("1. NORMAL RETRIEVER: N/A\n\n")
             
-            # 2. Supervised results
-            if results['supervised']:
-                supervised_metrics = results['supervised']['metrics']
-                f.write("2. LORA SUPERVISED RETRIEVER (LoRA Fine-tuned):\n")
+            # 2. LoRA results
+            if results['lora']:
+                lora_metrics = results['lora']['metrics']
+                f.write("2. LORA FINE-TUNED RETRIEVER (LoRA Fine-tuned):\n")
                 f.write("   Primary Metrics:\n")
                 for metric in primary_metrics:
-                    if metric in supervised_metrics:
-                        f.write(f"     {metric}: {supervised_metrics[metric]:.4f}")
+                    if metric in lora_metrics:
+                        f.write(f"     {metric}: {lora_metrics[metric]:.4f}")
                         # Add improvement vs zero-shot
                         if results['zeroshot'] and metric in results['zeroshot']:
-                            abs_imp = supervised_metrics[metric] - results['zeroshot'][metric]
+                            abs_imp = lora_metrics[metric] - results['zeroshot'][metric]
                             rel_imp = (abs_imp / results['zeroshot'][metric] * 100) if results['zeroshot'][metric] > 0 else 0
                             f.write(f"  (vs zero-shot: {abs_imp:+.4f} / {rel_imp:+.2f}%)")
                         f.write("\n")
-                f.write(f"   Total metrics computed: {len(supervised_metrics)}\n")
+                f.write(f"   Total metrics computed: {len(lora_metrics)}\n")
                 f.write("\n")
             else:
-                f.write("2. LORA SUPERVISED RETRIEVER: N/A (No training data)\n\n")
+                f.write("2. LORA FINE-TUNED RETRIEVER: N/A (No training data)\n\n")
             
             # 3. MAW results
             if results['maw']:
                 maw_metrics = results['maw']['metrics']
-                f.write("3. MAW SUPERVISED RETRIEVER (GRPO on last layer):\n")
+                f.write("3. MAW FINE-TUNED RETRIEVER (GRPO on last layer):\n")
                 f.write("   Primary Metrics:\n")
                 for metric in primary_metrics:
                     if metric in maw_metrics:
@@ -2641,18 +2708,18 @@ def run_complete_benchmark(config: Tier1Config):
                 f.write(f"   Total metrics computed: {len(maw_metrics)}\n")
                 f.write("\n")
                 
-                # Key comparison: MAW vs Supervised
-                if results['supervised']:
-                    f.write("   KEY COMPARISON - MAW vs Supervised Baseline (Primary Metrics):\n")
-                    supervised_metrics = results['supervised']['metrics']
+                # Key comparison: MAW vs LoRA
+                if results['lora']:
+                    f.write("   KEY COMPARISON - MAW vs LoRA Baseline (Primary Metrics):\n")
+                    lora_metrics = results['lora']['metrics']
                     for metric in primary_metrics:
-                        if metric in maw_metrics and metric in supervised_metrics:
-                            abs_imp = maw_metrics[metric] - supervised_metrics[metric]
-                            rel_imp = (abs_imp / supervised_metrics[metric] * 100) if supervised_metrics[metric] > 0 else 0
+                        if metric in maw_metrics and metric in lora_metrics:
+                            abs_imp = maw_metrics[metric] - lora_metrics[metric]
+                            rel_imp = (abs_imp / lora_metrics[metric] * 100) if lora_metrics[metric] > 0 else 0
                             f.write(f"     {metric}: {abs_imp:+.4f} absolute / {rel_imp:+.2f}% relative\n")
                     f.write("\n")
             else:
-                f.write("3. MAW SUPERVISED RETRIEVER: N/A (No training data)\n\n")
+                f.write("3. MAW FINE-TUNED RETRIEVER: N/A (No training data)\n\n")
     
     print(f"\n{'='*100}")
     print(f"{'BENCHMARK COMPLETE':^100}")
@@ -2698,7 +2765,7 @@ def run_complete_benchmark(config: Tier1Config):
         dataset_dir = checkpoint_base / safe_name
         if dataset_dir.exists():
             print(f"   📂 {safe_name}/")
-            for model_type in ['supervised', 'maw']:
+            for model_type in ['lora', 'maw']:
                 model_dir = dataset_dir / model_type
                 if model_dir.exists():
                     print(f"      └── {model_type}/")
@@ -2818,8 +2885,8 @@ def create_output_readme(log_dir: Path, timestamp: str):
         f.write("- **Configuration**: Seeds, hyperparameters, etc.\n")
         f.write("- **Results**:\n")
         f.write("  1. `1_normal_retriever`: Zero-shot (no training)\n")
-        f.write("  2. `2_lora_supervised_retriever`: LoRA fine-tuned\n")
-        f.write("  3. `3_maw_supervised_retriever`: MAW fine-tuned\n")
+        f.write("  2. `2_lora_fine_tuned_retriever`: LoRA fine-tuned (parameter-efficient)\n")
+        f.write("  3. `3_maw_fine_tuned_retriever`: MAW fine-tuned\n")
         f.write("- **Improvements**: Absolute and relative % improvements\n")
         f.write("- **Training History**: Loss curves, validation metrics\n\n")
         
@@ -2828,12 +2895,13 @@ def create_output_readme(log_dir: Path, timestamp: str):
         f.write("   - No training, baseline performance\n")
         f.write("   - Uses pre-trained model as-is\n\n")
         
-        f.write("2. **LoRA Supervised Retriever**\n")
-        f.write("   - Fine-tuned using LoRA on last layer\n")
+        f.write("2. **LoRA Fine-Tuned Retriever**\n")
+        f.write("   - Parameter-efficient fine-tuning using LoRA adapters\n")
+        f.write("   - Only trains small low-rank matrices (thousands of parameters)\n")
         f.write("   - Trained on training set, validated on validation set\n")
         f.write("   - Evaluated on test set (unseen during training)\n\n")
         
-        f.write("3. **MAW Supervised Retriever**\n")
+        f.write("3. **MAW Fine-Tuned Retriever**\n")
         f.write("   - Fine-tuned using Multi-Attention-Weight mechanism\n")
         f.write("   - GRPO (Group Relative Policy Optimization) on last layer\n")
         f.write("   - Trained on training set, validated on validation set\n")
