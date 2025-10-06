@@ -440,25 +440,38 @@ class GRPORouter(nn.Module):
     def select_optimal_attention(self, attention_weights_5d: torch.Tensor) -> torch.Tensor:
         """
         Select optimal 4D attention weights from 5D attention weights using RL policy.
+        OPTIMIZED: Fully parallel version for multi-GPU compatibility (no .item() calls!)
         
         Args:
             attention_weights_5d: (batch_size, num_heads, seq_len_query, seq_len_key, depth)
         Returns:
             attention_weights_4d: (batch_size, num_heads, seq_len_query, seq_len_key)
         """
-        batch_size = attention_weights_5d.shape[0]
-        depth_indices = self.get_depth_selection(attention_weights_5d)
+        batch_size, num_heads, seq_q, seq_k, depth = attention_weights_5d.shape
+        depth_indices = self.get_depth_selection(attention_weights_5d)  # (batch_size,)
         
-        # Select the optimal depth for each batch item
-        selected_attention = []
-        for batch_idx in range(batch_size):
-            selected_depth = depth_indices[batch_idx].item()
-            # Extract 4D attention weights for selected depth
-            attention_4d = attention_weights_5d[batch_idx, :, :, :, selected_depth]  # (heads, seq_q, seq_k)
-            selected_attention.append(attention_4d)
+        # PARALLEL SELECTION: Use advanced indexing instead of Python loop
+        # Create batch indices
+        batch_indices = torch.arange(batch_size, device=attention_weights_5d.device)
         
-        # Stack back to batch dimension
-        attention_weights_4d = torch.stack(selected_attention, dim=0)  # (batch, heads, seq_q, seq_k)
+        # Select using advanced indexing (fully parallel, no CPU sync!)
+        # attention_weights_5d: (batch, heads, seq_q, seq_k, depth)
+        # depth_indices: (batch,)
+        # We want: attention_weights_5d[b, :, :, :, depth_indices[b]] for all b
+        
+        # Reshape for gathering along depth dimension
+        # (batch, heads, seq_q, seq_k, depth) -> (batch, heads*seq_q*seq_k, depth)
+        attn_flat = attention_weights_5d.view(batch_size, num_heads * seq_q * seq_k, depth)
+        
+        # Expand depth_indices for gathering: (batch,) -> (batch, heads*seq_q*seq_k)
+        depth_indices_expanded = depth_indices.unsqueeze(1).expand(batch_size, num_heads * seq_q * seq_k)
+        
+        # Gather: select depth for each position (fully parallel!)
+        attention_4d_flat = torch.gather(attn_flat, dim=2, index=depth_indices_expanded.unsqueeze(2)).squeeze(2)
+        
+        # Reshape back: (batch, heads*seq_q*seq_k) -> (batch, heads, seq_q, seq_k)
+        attention_weights_4d = attention_4d_flat.view(batch_size, num_heads, seq_q, seq_k)
+        
         return attention_weights_4d
     
     def compute_grpo_loss(self, attention_weights_5d: torch.Tensor, 
@@ -844,15 +857,24 @@ def train_grpo_rl_on_dataset(model: MAWWithGRPOEncoder, queries: List[torch.Tens
                 
             optimizer.zero_grad()
             
-            # Get baseline scores (NON-MAW performance for comparison)
-            baseline_scores = []
+            # Get baseline scores (NON-MAW performance for comparison) - BATCHED
             non_maw_model = NonMAWEncoder(model.config).to(device)
             with torch.no_grad():
-                query_repr_baseline = non_maw_model(query).mean(dim=1)
-                for doc in query_docs:
-                    doc_repr_baseline = non_maw_model(doc).mean(dim=1)
-                    sim_baseline = F.cosine_similarity(query_repr_baseline, doc_repr_baseline, dim=-1)
-                    baseline_scores.append(sim_baseline.item())
+                query_repr_baseline = non_maw_model(query).mean(dim=1)  # (1, hidden_dim)
+                
+                # BATCHED: Process all documents at once
+                if len(query_docs) > 0:
+                    doc_batch = torch.cat(query_docs, dim=0)  # Concatenate all docs
+                    doc_batch_repr = non_maw_model(doc_batch).mean(dim=1)  # (num_docs, hidden_dim)
+                    
+                    # Expand query to match batch
+                    query_repr_expanded = query_repr_baseline.expand(doc_batch_repr.shape[0], -1)
+                    
+                    # Compute all similarities in parallel
+                    sim_baseline_tensor = F.cosine_similarity(query_repr_expanded, doc_batch_repr, dim=-1)
+                    baseline_scores = sim_baseline_tensor.cpu().tolist()  # Convert once
+                else:
+                    baseline_scores = []
             
             # Get 5D attention weights from MAW model
             # Find first MAW layer to extract attention weights
@@ -956,13 +978,24 @@ def evaluate_model_on_dataset(model: nn.Module, model_name: str,
             query_output = model(query)
             query_repr = query_output.mean(dim=1)  # (1, hidden_dim)
             
-            # Compute similarities with all documents
-            similarities = []
-            for doc in query_docs:
-                doc_output = model(doc)
-                doc_repr = doc_output.mean(dim=1)  # (1, hidden_dim)
-                similarity = F.cosine_similarity(query_repr, doc_repr, dim=-1)
-                similarities.append(similarity.item())
+            # BATCHED: Compute similarities with all documents at once
+            # Stack all documents into a single batch for parallel processing
+            if len(query_docs) > 0:
+                # Concatenate all documents along batch dimension
+                doc_batch = torch.cat(query_docs, dim=0)  # (num_docs * seq_len, ...) 
+                
+                # Process all documents in one forward pass
+                doc_batch_output = model(doc_batch)  # (num_docs, seq_len, hidden_dim)
+                doc_batch_repr = doc_batch_output.mean(dim=1)  # (num_docs, hidden_dim)
+                
+                # Expand query representation to match batch size
+                query_repr_expanded = query_repr.expand(doc_batch_repr.shape[0], -1)  # (num_docs, hidden_dim)
+                
+                # Compute all similarities in parallel
+                similarities_tensor = F.cosine_similarity(query_repr_expanded, doc_batch_repr, dim=-1)  # (num_docs,)
+                similarities = similarities_tensor.cpu().tolist()  # Convert to list once
+            else:
+                similarities = []
             
             # Sort documents by similarity (descending)
             doc_sim_pairs = list(zip(similarities, query_rel))

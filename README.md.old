@@ -1,1441 +1,722 @@
-# Multi-Attention-Weight Transformers (MAW)# Multi-Attention-Weight (MAW) Transformers# Multi-Attention-Weight (MAW) Transformers# Multi-Attention-Weight (MAW) Transformers
+# Multi-Attention-Weight (MAW) Transformers# Multi-Attention-Weight (MAW) Transformers# Multi-Attention-Weight (MAW) Transformers
 
 
 
-**Fully Optimized for Multi-GPU Batched Processing**
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
 
 
-A PyTorch implementation of Multi-Attention-Weight (MAW) Transformers with Group-Relative Policy Optimization (GRPO) for information retrieval tasks. This codebase is production-ready with comprehensive multi-GPU support and batched processing optimizations.[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+A novel transformer architecture that learns **multiple attention strategies simultaneously** and dynamically selects the optimal one for each query-key pair. This implementation includes comprehensive evaluation following **Tier-1 conference standards** (SIGIR, WWW, WSDM, NeurIPS) with **36 comprehensive TIER-1 metrics**.[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 
 
-
----[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-
-
-
-## 🚀 Quick Start[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-
-
-
-### Installation
-
-
-
-```bashA novel transformer architecture that learns **multiple attention strategies simultaneously** and dynamically selects the optimal one for each query-key pair. This implementation includes comprehensive evaluation following **Tier-1 conference standards** (SIGIR, WWW, WSDM, NeurIPS) with **36 comprehensive TIER-1 metrics**.[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)[![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
-
-# Clone the repository
-
-git clone https://github.com/denizaskin/Multi-Attention-Weight-Transformers.git
-
-cd Multi-Attention-Weight-Transformers
 
 ---[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-# Install dependencies
 
-pip install -r requirements.txt
-
-```
 
 ## 📋 Table of Contents
 
-### Basic Usage
 
 
-
-```bash
-
-# Run with all available GPUs (recommended)- [Overview](#-overview)A novel transformer architecture that learns **multiple attention strategies simultaneously** and dynamically selects the optimal one for each query-key pair. This implementation includes comprehensive evaluation following **Tier-1 conference standards** (SIGIR, WWW, WSDM, NeurIPS).A novel transformer architecture that learns **multiple attention strategies simultaneously** and dynamically selects the optimal one for each query-key pair. This implementation includes comprehensive evaluation following **Tier-1 conference standards** (SIGIR, WWW, WSDM, NeurIPS).
-
-python tier_1.py
+- [Overview](#-overview)A novel transformer architecture that learns **multiple attention strategies simultaneously** and dynamically selects the optimal one for each query-key pair. This implementation includes comprehensive evaluation following **Tier-1 conference standards** (SIGIR, WWW, WSDM, NeurIPS).A novel transformer architecture that learns **multiple attention strategies simultaneously** and dynamically selects the optimal one for each query-key pair. This implementation includes comprehensive evaluation following **Tier-1 conference standards** (SIGIR, WWW, WSDM, NeurIPS).
 
 - [Key Features](#-key-features)
 
-# Run with specific GPUs
-
-CUDA_VISIBLE_DEVICES=0,1 python tier_1.py  # 2 GPUs- [Quick Start](#-quick-start)
-
-CUDA_VISIBLE_DEVICES=0 python tier_1.py    # 1 GPU
+- [Quick Start](#-quick-start)
 
 - [Tier-1 Evaluation Framework](#-tier-1-evaluation-framework)
 
-# Run batching verification tests
+- [TIER-1 Comprehensive Metrics (36 Total)](#-tier-1-comprehensive-metrics-36-total)------
 
-python test_batching.py- [TIER-1 Comprehensive Metrics (36 Total)](#-tier-1-comprehensive-metrics-36-total)------
+- [Architecture](#-architecture)
 
+- [Multi-Layer Support](#-multi-layer-support)
 
+- [Usage Examples](#-usage-examples)
 
-# Run multi-GPU tests- [Architecture](#-architecture)
+- [Datasets](#-datasets)## 📋 Table of Contents## 📋 Table of Contents
 
-python test_multi_gpu.py
+- [Hardware & Performance](#-hardware--performance)
 
-```- [Multi-Layer Support](#-multi-layer-support)
+- [Logging & Output Structure](#-logging--output-structure)
 
+- [Model Checkpoints](#-model-checkpoints)
 
+- [Technical Details](#-technical-details)- [Overview](#-overview)- [Overview](#-overview)
 
----- [Usage Examples](#-usage-examples)
+- [Installation](#-installation)
 
+- [Expected Results](#-expected-results)- [Key Features](#-key-features)- [Key Features](#-key-features)
 
+- [Troubleshooting](#-troubleshooting)
 
-## 📊 Performance Highlights- [Datasets](#-datasets)## 📋 Table of Contents## 📋 Table of Contents
+- [Citation](#-citation)- [Quick Start](#-quick-start)- [Quick Start](#-quick-start)
 
 
 
-| Metric | Before Optimization | After Optimization | Speedup |- [Hardware & Performance](#-hardware--performance)
+---- [Tier-1 Evaluation Framework](#-tier-1-evaluation-framework)- [Tier-1 Evaluation Framework](#-tier-1-evaluation-framework)
 
-|--------|--------------------|--------------------|---------|
 
-| **Query processing** | 1 query/sec | 64 queries/sec | **64x** ⚡ |- [Logging & Output Structure](#-logging--output-structure)
 
-| **Document similarity** | 0.04 q/s | 105 q/s | **2435x** 🔥 |
+## 🎯 Overview- [JSON Output Format](#-json-output-format)- [Architecture](#-architecture)
 
-| **GPU utilization** (4 GPUs) | 30% (1 GPU) | 95% (all 4 GPUs) | **12.7x total** 📈 |- [Model Checkpoints](#-model-checkpoints)
 
-| **Full evaluation** | ~20 minutes | ~1 minute | **20x** ⚡ |
 
-| **Training speed** | 10 batch/s | 30 batch/s | **3x** 🚀 |- [Technical Details](#-technical-details)- [Overview](#-overview)- [Overview](#-overview)
+**Traditional transformers** compute a single attention weight for each query-key pair. **MAW transformers** compute **multiple attention weights at different "depths"** and learn to select the optimal one.- [Understanding Improvements](#-understanding-improvements)- [Multi-Layer Support](#-multi-layer-support)
 
 
 
----- [Installation](#-installation)
+### The Core Innovation- [Architecture](#-architecture)- [Usage Examples](#-usage-examples)
 
 
 
-## ✨ Key Features- [Expected Results](#-expected-results)- [Key Features](#-key-features)- [Key Features](#-key-features)
+```- [Multi-Layer Support](#-multi-layer-support)- [Datasets](#-datasets)
 
+Traditional 4D Attention:
 
+Q × K^T → Single attention weight per query-key pair- [Usage Examples](#-usage-examples)- [Evaluation Metrics](#-evaluation-metrics)
 
-### 1. **Fully Batched Operations**- [Troubleshooting](#-troubleshooting)
+Shape: (batch, heads, seq_q, seq_k)
 
-- ✅ Query encoding: Processes 64 queries at once
+- [Datasets](#-datasets)- [Logging System](#-logging-system)
 
-- ✅ Document encoding: Batched encoding for all documents- [Citation](#-citation)- [Quick Start](#-quick-start)- [Quick Start](#-quick-start)
+MAW 5D Attention:
 
-- ✅ Similarity computation: Fully vectorized (no loops)
+Q × K^T → 32 attention weights per query-key pair- [Evaluation Metrics](#-evaluation-metrics)- [Technical Details](#-technical-details)
 
-- ✅ **No `.item()` calls in critical paths** (prevents deadlocks)
+Shape: (batch, heads, seq_q, seq_k, depth)
 
-
-
-### 2. **Multi-GPU Support**---- [Tier-1 Evaluation Framework](#-tier-1-evaluation-framework)- [Tier-1 Evaluation Framework](#-tier-1-evaluation-framework)
-
-- ✅ Works with **any number of GPUs** (1, 2, 4, 6, 8+)
-
-- ✅ DataParallel automatically splits batches across all GPUs
-
-- ✅ NCCL configuration prevents hangs
-
-- ✅ 95%+ GPU utilization on all GPUs## 🎯 Overview- [JSON Output Format](#-json-output-format)- [Architecture](#-architecture)
-
-
-
-### 3. **Storage Optimization**
-
-- ✅ 90% reduction in checkpoint storage (42-69GB → 3-5GB)
-
-- ✅ Compressed logs with automatic cleanup**Traditional transformers** compute a single attention weight for each query-key pair. **MAW transformers** compute **multiple attention weights at different "depths"** and learn to select the optimal one.- [Understanding Improvements](#-understanding-improvements)- [Multi-Layer Support](#-multi-layer-support)
-
-- ✅ Smart checkpoint management (keep only best)
-
-- ✅ FAISS GPU vector database optimization
-
-
-
-### 4. **Comprehensive Metrics**### The Core Innovation- [Architecture](#-architecture)- [Usage Examples](#-usage-examples)
-
-- ✅ 36 TIER-1 metrics (BEIR benchmark standard)
-
-- ✅ MS MARCO, Natural Questions, HotpotQA, TriviaQA
-
-- ✅ Proper train/validation/test splits (no data leakage)
-
-- ✅ Statistical significance testing```- [Multi-Layer Support](#-multi-layer-support)- [Datasets](#-datasets)
-
-
-
----Traditional 4D Attention:
-
-
-
-## 🏗️ ArchitectureQ × K^T → Single attention weight per query-key pair- [Usage Examples](#-usage-examples)- [Evaluation Metrics](#-evaluation-metrics)
-
-
-
-### Multi-Attention-Weight (MAW) EncoderShape: (batch, heads, seq_q, seq_k)
+Router selects optimal depth dynamically- [Hardware Requirements](#-hardware-requirements)- [Installation](#-installation)
 
 ```
 
-Input → Embedding → MAW Layer 1 → ... → MAW Layer N → Output- [Datasets](#-datasets)- [Logging System](#-logging-system)
+- [Logging System](#-logging-system)- [Expected Results](#-expected-results)
 
-                          ↓
+The model dynamically selects which depth to use via:
 
-                    GRPO Router (RL-based attention selection)MAW 5D Attention:
-
-                          ↓
-
-                    5D Attention WeightsQ × K^T → 32 attention weights per query-key pair- [Evaluation Metrics](#-evaluation-metrics)- [Technical Details](#-technical-details)
-
-                 (batch, heads, depth, seq_q, seq_k)
-
-```Shape: (batch, heads, seq_q, seq_k, depth)
-
-
-
-### Key ComponentsRouter selects optimal depth dynamically- [Hardware Requirements](#-hardware-requirements)- [Installation](#-installation)
-
-- **MAWAttentionLayer**: Multi-depth attention mechanism
-
-- **GRPORouter**: Reinforcement learning policy for attention selection```
-
-- **Tier1Retriever**: Production-ready retrieval model with fine-tuning
-
-- **BaselineRetriever**: Non-MAW baseline with optional LoRA- [Logging System](#-logging-system)- [Expected Results](#-expected-results)
-
-
-
----The model dynamically selects which depth to use via:
-
-
-
-## 📖 Configuration1. **GRPO (Group Relative Policy Optimization)**: Reinforcement learning-based selection- [Technical Details](#-technical-details)- [Citation](#-citation)
-
-
-
-### Tier-1 Evaluation Config2. **Supervised Classification**: Neural classifier for depth selection
-
-
-
-```python- [Installation](#-installation)
-
-@dataclass
-
-class Tier1Config:---
-
-    # Model settings
-
-    hidden_dim: int = 768          # Match BERT-base- [Expected Results](#-expected-results)---
-
-    num_heads: int = 12
-
-    num_layers: int = 12## ✨ Key Features
-
-    
-
-    # Training settings- [Troubleshooting](#-troubleshooting)
-
-    batch_size: int = 32           # Training batch size
-
-    eval_batch_size: int = 64      # Evaluation batch size (can be larger)- **5D Attention Mechanism**: From 4D `(batch, heads, seq_q, seq_k)` to 5D `(batch, heads, seq_q, seq_k, depth)`
-
-    learning_rate: float = 1e-5
-
-    num_epochs: int = 10- **Dual Depth Selection**: GRPO Router + Supervised Classifier- [Citation](#-citation)## 🎯 Overview
-
-    
-
-    # Multi-GPU settings- **Multi-Layer Architecture**: Stack 1-12 layers, apply MAW selectively
-
-    use_multi_gpu: bool = True     # Use DataParallel across all GPUs
-
-    parallel_datasets: bool = True # Run datasets in parallel- **Tier-1 Evaluation**: BEIR, MS MARCO, LoTTE benchmarks following SIGIR/WWW/WSDM/NeurIPS standards
-
-    
-
-    # Storage optimization- **36 Comprehensive Metrics**: All TIER-1 metrics computed for every method and dataset
-
-    keep_only_best_checkpoint: bool = True
-
-    checkpoint_compression: bool = True- **Multi-GPU Support**: DataParallel optimization for 4x NVIDIA A40 GPUs---**Traditional transformers** compute a single attention weight for each query-key pair. **MAW transformers** compute **multiple attention weights at different "depths"** and learn to select the optimal one.
-
-    clear_cuda_cache: bool = True
-
-    compress_logs: bool = True- **Automatic Logging**: JSON + TXT formats with timestamps
-
-```
-
-- **Model Checkpoints**: Best, latest, and epoch-level checkpoints saved
-
-### Adjust for Your Hardware
-
-- **Reproducibility**: Fixed seeds, documented hyperparameters
-
-**More GPU Memory:**
-
-```python## 🎯 OverviewThe model dynamically selects which depth to use via:
-
-config = Tier1Config(
-
-    batch_size=64,           # Increase from 32---
-
-    eval_batch_size=128      # Increase from 64
-
-)1. **GRPO (Group Relative Policy Optimization)**: Reinforcement learning-based selection
-
-```
-
-## 🚀 Quick Start
-
-**Less GPU Memory:**
-
-```python**Traditional transformers** compute a single attention weight for each query-key pair. **MAW transformers** compute **multiple attention weights at different "depths"** and learn to select the optimal one.2. **Supervised Classification**: Neural classifier for depth selection
-
-config = Tier1Config(
-
-    batch_size=16,           # Reduce from 32### Installation
-
-    eval_batch_size=32       # Reduce from 64
-
-)
-
-```
-
-```bash
-
-**Rule of thumb:** `batch_size` should be ≥ `num_GPUs × 4` for optimal multi-GPU utilization.
-
-git clone https://github.com/denizaskin/Multi-Attention-Weight-Transformers.git### The Core Innovation---
-
----
-
-cd Multi-Attention-Weight-Transformers
-
-## 🔧 Optimization Details
-
-pip install -r requirements.txt
-
-### 1. Batched Query Processing
-
-```
-
-**Before (Sequential):**
-
-```python```## ✨ Key Features
-
-# ❌ Slow: Process one query at a time
-
-for qid in query_ids:### Run Tier-1 Evaluation
-
-    query_emb = encode_single(qid)
-
-    scores = compute_similarity(query_emb, all_docs)Traditional 4D Attention:
-
-```
-
-```bash
-
-**After (Batched):**
-
-```python# Default run - evaluates 4 datasets with 3 approaches eachQ × K^T → Single attention weight per query-key pair- **5D Attention Mechanism**: From 4D `(batch, heads, seq_q, seq_k)` to 5D `(batch, heads, seq_q, seq_k, depth)`
-
-# ✅ Fast: Process 64 queries at once
-
-for query_batch in query_batches:# Runtime: 1.3-1.7 hours on 4x NVIDIA A40 GPUs (with multi-GPU)
-
-    query_embs = encode_batch(query_batch)  # 64 queries
-
-    scores_batch = matmul(query_embs, doc_embs.T)  # Fully parallelpython3 tier_1.pyShape: (batch, heads, seq_q, seq_k)- **Dual Depth Selection**: GRPO Router + Supervised Classifier
-
-```
-
-
-
-### 2. Batched Document Encoding
-
-# Quick test (10-15 minutes)- **Multi-Layer Architecture**: Stack 1-12 layers, apply MAW selectively
-
-**Before (Sequential):**
-
-```pythonpython3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3
-
-# ❌ Slow: Encode docs one at a time + N CPU syncs
-
-similarities = []MAW 5D Attention:- **Tier-1 Evaluation**: BEIR, MS MARCO, LoTTE benchmarks following SIGIR/WWW/WSDM/NeurIPS standards
-
-for doc in query_docs:
-
-    doc_repr = model(doc)  # N forward passes# Full evaluation (publication quality)
-
-    sim = cosine_similarity(query_repr, doc_repr)
-
-    similarities.append(sim.item())  # N CPU syncs!python3 tier_1.py --train-samples 10000 --test-samples 5000 --num-epochs 20Q × K^T → 32 attention weights per query-key pair- **Comprehensive Metrics**: Precision, Recall, MRR, NDCG, MAP, Success@K
-
-```
-
-```
-
-**After (Batched):**
-
-```pythonShape: (batch, heads, seq_q, seq_k, depth)- **Automatic Logging**: JSON + TXT formats with timestamps
-
-# ✅ Fast: Encode all docs at once
-
-doc_batch = torch.cat(query_docs, dim=0)  # Stack all docs### Run GRPO Evaluation
-
-doc_batch_repr = model(doc_batch)  # 1 forward pass
-
-query_expanded = query_repr.expand(len(docs), -1)Router selects optimal depth dynamically- **Reproducibility**: Fixed seeds, documented hyperparameters
-
-similarities = cosine_similarity(query_expanded, doc_batch_repr)
-
-results = similarities.cpu().tolist()  # Single CPU transfer```bash
-
-```
-
-python3 benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 100 --epochs 10```
-
-**Performance Impact:** 2435x faster (measured!)
-
-```
-
-### 3. NCCL Configuration
-
----
-
-**Critical for multi-GPU stability:**
-
-```python---
-
-# Set BEFORE importing torch
-
-import osThe model dynamically selects which depth to use via:
-
-os.environ['NCCL_P2P_DISABLE'] = '1'
-
-os.environ['NCCL_IB_DISABLE'] = '1'## 🏆 Tier-1 Evaluation Framework
-
-os.environ['NCCL_BLOCKING_WAIT'] = '1'
-
-os.environ['NCCL_ASYNC_ERROR_HANDLING'] = '1'1. **GRPO (Group Relative Policy Optimization)**: Reinforcement learning-based selection## 🚀 Quick Start
-
-
-
-import torch  # Import after setting env vars### What is tier_1.py?
-
-```
+1. **GRPO (Group Relative Policy Optimization)**: Reinforcement learning-based selection- [Technical Details](#-technical-details)- [Citation](#-citation)
 
 2. **Supervised Classification**: Neural classifier for depth selection
 
-These settings prevent DataParallel hangs on certain GPU configurations (especially A40/A100).
-
-`tier_1.py` is a comprehensive evaluation framework following standards from top-tier IR conferences (SIGIR, WWW, WSDM, NeurIPS). When you run it, it automatically:
+- [Installation](#-installation)
 
 ---
+
+- [Expected Results](#-expected-results)---
+
+## ✨ Key Features
+
+- [Troubleshooting](#-troubleshooting)
+
+- **5D Attention Mechanism**: From 4D `(batch, heads, seq_q, seq_k)` to 5D `(batch, heads, seq_q, seq_k, depth)`
+
+- **Dual Depth Selection**: GRPO Router + Supervised Classifier- [Citation](#-citation)## 🎯 Overview
+
+- **Multi-Layer Architecture**: Stack 1-12 layers, apply MAW selectively
+
+- **Tier-1 Evaluation**: BEIR, MS MARCO, LoTTE benchmarks following SIGIR/WWW/WSDM/NeurIPS standards
+
+- **36 Comprehensive Metrics**: All TIER-1 metrics computed for every method and dataset
+
+- **Multi-GPU Support**: DataParallel optimization for 4x NVIDIA A40 GPUs---**Traditional transformers** compute a single attention weight for each query-key pair. **MAW transformers** compute **multiple attention weights at different "depths"** and learn to select the optimal one.
+
+- **Automatic Logging**: JSON + TXT formats with timestamps
+
+- **Model Checkpoints**: Best, latest, and epoch-level checkpoints saved
+
+- **Reproducibility**: Fixed seeds, documented hyperparameters
+
+## 🎯 OverviewThe model dynamically selects which depth to use via:
+
+---
+
+1. **GRPO (Group Relative Policy Optimization)**: Reinforcement learning-based selection
+
+## 🚀 Quick Start
+
+**Traditional transformers** compute a single attention weight for each query-key pair. **MAW transformers** compute **multiple attention weights at different "depths"** and learn to select the optimal one.2. **Supervised Classification**: Neural classifier for depth selection
 
 ### Installation
 
-## 🧪 Testing
+
+
+```bash
+
+git clone https://github.com/denizaskin/Multi-Attention-Weight-Transformers.git### The Core Innovation---
+
+cd Multi-Attention-Weight-Transformers
+
+pip install -r requirements.txt
+
+```
+
+```## ✨ Key Features
+
+### Run Tier-1 Evaluation
+
+Traditional 4D Attention:
+
+```bash
+
+# Default run - evaluates 4 datasets with 3 approaches eachQ × K^T → Single attention weight per query-key pair- **5D Attention Mechanism**: From 4D `(batch, heads, seq_q, seq_k)` to 5D `(batch, heads, seq_q, seq_k, depth)`
+
+# Runtime: 1.3-1.7 hours on 4x NVIDIA A40 GPUs (with multi-GPU)
+
+python3 tier_1.pyShape: (batch, heads, seq_q, seq_k)- **Dual Depth Selection**: GRPO Router + Supervised Classifier
+
+
+
+# Quick test (10-15 minutes)- **Multi-Layer Architecture**: Stack 1-12 layers, apply MAW selectively
+
+python3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3
+
+MAW 5D Attention:- **Tier-1 Evaluation**: BEIR, MS MARCO, LoTTE benchmarks following SIGIR/WWW/WSDM/NeurIPS standards
+
+# Full evaluation (publication quality)
+
+python3 tier_1.py --train-samples 10000 --test-samples 5000 --num-epochs 20Q × K^T → 32 attention weights per query-key pair- **Comprehensive Metrics**: Precision, Recall, MRR, NDCG, MAP, Success@K
+
+```
+
+Shape: (batch, heads, seq_q, seq_k, depth)- **Automatic Logging**: JSON + TXT formats with timestamps
+
+### Run GRPO Evaluation
+
+Router selects optimal depth dynamically- **Reproducibility**: Fixed seeds, documented hyperparameters
+
+```bash
+
+python3 benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 100 --epochs 10```
+
+```
+
+---
+
+---
+
+The model dynamically selects which depth to use via:
+
+## 🏆 Tier-1 Evaluation Framework
+
+1. **GRPO (Group Relative Policy Optimization)**: Reinforcement learning-based selection## 🚀 Quick Start
+
+### What is tier_1.py?
+
+2. **Supervised Classification**: Neural classifier for depth selection
+
+`tier_1.py` is a comprehensive evaluation framework following standards from top-tier IR conferences (SIGIR, WWW, WSDM, NeurIPS). When you run it, it automatically:
+
+### Installation
 
 **1. Evaluates 4 Datasets:**
 
-### Batching Verification Test
+- MS MARCO (MSFT/TREC) - Passage ranking---
 
-```bash- MS MARCO (MSFT/TREC) - Passage ranking---
+- BEIR Natural Questions (EMNLP'20) - QA retrieval
 
-python test_batching.py
+- BEIR HotpotQA (EMNLP'18) - Multi-hop reasoning```bash
 
-```- BEIR Natural Questions (EMNLP'20) - QA retrieval
+- BEIR TriviaQA (ACL'17) - Trivia questions
 
+## ✨ Key Featuresgit clone https://github.com/denizaskin/Multi-Attention-Weight-Transformers.git
 
+**2. Tests 3 Approaches per Dataset:**
 
-**Expected Output:**- BEIR HotpotQA (EMNLP'18) - Multi-hop reasoning```bash
+- **Zero-shot (No Training)**: Off-the-shelf retriever baselinecd Multi-Attention-Weight-Transformers
 
-```
-
-================================================================================- BEIR TriviaQA (ACL'17) - Trivia questions
-
-✅ ALL BATCHING TESTS PASSED!
-
-================================================================================## ✨ Key Featuresgit clone https://github.com/denizaskin/Multi-Attention-Weight-Transformers.git
-
-
-
-Key Results:**2. Tests 3 Approaches per Dataset:**
-
-  1. ✅ All operations support batching (1-64+ samples)
-
-  2. ✅ Batched operations: 2434.9x faster than sequential- **Zero-shot (No Training)**: Off-the-shelf retriever baselinecd Multi-Attention-Weight-Transformers
-
-  3. ✅ DataParallel splits batches across 4 GPUs automatically
-
-  4. ✅ No .item() calls in critical paths (no deadlock risk)- **LoRA Supervised Fine-tuned**: Standard transformer with LoRA fine-tuning
-
-```
+- **LoRA Supervised Fine-tuned**: Standard transformer with LoRA fine-tuning
 
 - **MAW Fine-tuned**: MAW transformer with GRPO on last layer- **5D Attention Mechanism**: From 4D `(batch, heads, seq_q, seq_k)` to 5D `(batch, heads, seq_q, seq_k, depth)`pip install -r requirements.txt
 
-### Multi-GPU Verification Test
-
-```bash
-
-python test_multi_gpu.py
-
-```**3. Computes 36 TIER-1 Metrics:**- **Dual Depth Selection**: GRPO Router + Supervised Classifier```
 
 
+**3. Computes 36 TIER-1 Metrics:**- **Dual Depth Selection**: GRPO Router + Supervised Classifier```
 
-### Single GPU Test (Debugging)- All metrics computed for every method on every dataset
+- All metrics computed for every method on every dataset
 
-```bash
-
-CUDA_VISIBLE_DEVICES=0 python test_single_gpu.py- Includes ranking quality, recall, precision, diagnostics, efficiency, and calibration- **Multi-Layer Architecture**: Stack 1-12 layers, apply MAW selectively
-
-```
+- Includes ranking quality, recall, precision, diagnostics, efficiency, and calibration- **Multi-Layer Architecture**: Stack 1-12 layers, apply MAW selectively
 
 
-
----
 
 **4. Ensures Data Isolation:**- **Tier-1 Evaluation**: BEIR, MS MARCO, LoTTE benchmarks following SIGIR/WWW/WSDM/NeurIPS standards### Run Tier-1 Evaluation (NEW)
 
-## 📈 Multi-GPU Utilization
-
 - Train set → Fine-tuning ONLY
 
-### Before Optimization
+- Validation set → Early stopping ONLY- **Comprehensive Metrics**: Precision, Recall, MRR, NDCG, MAP, Success@K with both absolute and relative improvements
 
-```- Validation set → Early stopping ONLY- **Comprehensive Metrics**: Precision, Recall, MRR, NDCG, MAP, Success@K with both absolute and relative improvements
+- Test set → Final evaluation ONLY (completely unseen)
 
-Query Processing: Sequential (1 at a time)
-
-GPU 0: ███░░░░░░░ 30% ← Processing 1 query- Test set → Final evaluation ONLY (completely unseen)
-
-GPU 1: ░░░░░░░░░░  0% ← Idle (can't split single sample)
-
-GPU 2: ░░░░░░░░░░  0% ← Idle- **Automatic Per-Dataset Logging**: Individual JSON files for each dataset evaluation```bash
-
-GPU 3: ░░░░░░░░░░  0% ← Idle
+- **Automatic Per-Dataset Logging**: Individual JSON files for each dataset evaluation```bash
 
 **5. Saves Comprehensive Results:**
 
-Throughput: ~1 query/sec
+```- **Complete Reproducibility**: Fixed seeds, documented hyperparameters, all configs saved# Default run - evaluates 4 datasets with 3 approaches each
 
-``````- **Complete Reproducibility**: Fixed seeds, documented hyperparameters, all configs saved# Default run - evaluates 4 datasets with 3 approaches each
+logs/tier1/
 
+├── README_RESULTS.md                          # Documentationpython3 tier_1.py
 
+├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.json  # Complete results
 
-### After Optimizationlogs/tier1/
+├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.txt   # Human-readable---
 
-```
-
-Query Processing: Batched (64 at a time)├── README_RESULTS.md                          # Documentationpython3 tier_1.py
-
-GPU 0: ██████████ 95% ← Processing 16 queries
-
-GPU 1: ██████████ 95% ← Processing 16 queries├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.json  # Complete results
-
-GPU 2: ██████████ 95% ← Processing 16 queries
-
-GPU 3: ██████████ 95% ← Processing 16 queries├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.txt   # Human-readable---
-
-
-
-Throughput: ~64 queries/sec (64x faster!)├── ms_marco_results.json                      # Per-dataset results
-
-```
+├── ms_marco_results.json                      # Per-dataset results
 
 ├── beir_natural_questions_results.json# Quick test (5-10 min)
 
-**The code automatically verifies GPU utilization during the first batch:**
+├── beir_hotpotqa_results.json
 
-```├── beir_hotpotqa_results.json
-
-🔍 GPU Utilization Check (Training Batch 1):
-
-   GPU 0: 3.45 GB / 45.6 GB (85.2%) ✅ ACTIVE└── beir_triviaqa_results.json## 🚀 Quick Startpython3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3
-
-   GPU 1: 3.42 GB / 45.6 GB (83.7%) ✅ ACTIVE
-
-   GPU 2: 3.48 GB / 45.6 GB (84.9%) ✅ ACTIVE```
-
-   GPU 3: 3.39 GB / 45.6 GB (82.4%) ✅ ACTIVE
-
-   ✅ All 4 GPUs are actively being used!
+└── beir_triviaqa_results.json## 🚀 Quick Startpython3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3
 
 ```
+
+
 
 **6. Saves Model Checkpoints:**
 
----
-
 ```### Installation# Full evaluation (publication quality)
-
-## 🎯 Datasets Supported
 
 checkpoints/tier1/
 
-### BEIR Benchmark Datasets
+├── README_CHECKPOINTS.md                      # Documentationpython3 tier_1.py --train-samples 10000 --test-samples 5000 --num-epochs 20
 
-- **MS MARCO**: Passage ranking (MSFT/TREC)├── README_CHECKPOINTS.md                      # Documentationpython3 tier_1.py --train-samples 10000 --test-samples 5000 --num-epochs 20
+├── MS_MARCO/
 
-- **Natural Questions**: Question answering (TACL 2019)
-
-- **HotpotQA**: Multi-hop reasoning (EMNLP 2018)├── MS_MARCO/
-
-- **TriviaQA**: Trivia questions (EMNLP 2017)
-
-- **FiQA**: Financial QA (WWW 2018)│   ├── supervised/```bash```
-
-- **Quora**: Question similarity (NIPS 2017)
+│   ├── supervised/```bash```
 
 │   │   ├── best_model.pt
 
-### Metrics Computed (36 Total)
-
 │   │   ├── latest.ptgit clone https://github.com/denizaskin/Multi-Attention-Weight-Transformers.git
 
-**Ranking Quality:**
-
-- nDCG@k (k=1,5,10,20,100,1000)│   │   └── BEST_epoch003_nDCG0.4532_YYYYMMDD_HHMMSS.pt
-
-- MRR@k (k=1,5,10,20,100,1000)
+│   │   └── BEST_epoch003_nDCG0.4532_YYYYMMDD_HHMMSS.pt
 
 │   └── maw/cd Multi-Attention-Weight-Transformers### Run GRPO Evaluation
 
-**Coverage:**
-
-- Recall@k (k=1,5,10,20,100,1000)│       ├── best_model.pt
-
-- Success@k (k=1,5,10,20,100)
+│       ├── best_model.pt
 
 │       ├── latest.ptpip install -r requirements.txt
 
-**Precision:**
+│       └── BEST_epoch004_nDCG0.4755_YYYYMMDD_HHMMSS.pt
 
-- Precision@k (k=1,5,10,20,100)│       └── BEST_epoch004_nDCG0.4755_YYYYMMDD_HHMMSS.pt
+├── BEIR_Natural_Questions/``````bash
 
+├── BEIR_HotpotQA/
 
-
-**Rank Diagnostics:**├── BEIR_Natural_Questions/``````bash
-
-- Mean Rank, Median Rank
-
-- First Relevant Position├── BEIR_HotpotQA/
-
-
-
-**Efficiency:**└── BEIR_TriviaQA/python3 benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 100 --epochs 10
-
-- Latency (ms/query)
-
-- Throughput (queries/sec)```
-
-
-
-**Calibration:**### Run Tier-1 Evaluation```
-
-- Brier Score
-
-- Expected Calibration Error (ECE)### CLI Examples
-
-
-
----
-
-
-
-## 🏆 Comparison Tiers```bash
-
-
-
-### Tier 1: Off-the-shelf Retrievers# Default run```bash---
-
-- BM25 (classical)
-
-- ANCE (Microsoft)python3 tier_1.py
-
-- Contriever (Meta)
-
-- ColBERT/GTR (Stanford)# Default run - evaluates 4 datasets with 3 approaches each
-
-
-
-### Tier 2: Fine-tuned Baselines# Quick test
-
-- Non-MAW with LoRA fine-tuning
-
-- Non-MAW with last-layer fine-tuningpython3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3# Generates per-dataset JSON files with all metrics and improvements## 🏆 Tier-1 Evaluation Framework
-
-
-
-### Tier 3: MAW Retriever
-
-- MAW with GRPO router
-
-- MAW with final-layer fine-tuning# 12-layer BERT-base architecturepython3 tier_1.py
-
-
-
----python3 tier_1.py --num-layers 12 --maw-layers "12"
-
-
-
-## 💾 Storage Optimization### What is tier_1.py?
-
-
-
-### Checkpoint Management# MAW on last 2 layers (recommended)
-
-- ✅ **Keep only best checkpoint** per dataset/model
-
-- ✅ **Compression**: torch.save with compressionpython3 tier_1.py --num-layers 6 --maw-layers "5,6"# Quick test (5-10 min on GPU)
-
-- ✅ **Automatic cleanup**: Old checkpoints removed
-
-- ✅ **Result**: 90% reduction (42-69GB → 3-5GB)
-
-
-
-### Log Management# MAW on all layers (ablation study)python3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3`tier_1.py` is a comprehensive evaluation framework following standards from top-tier IR conferences (SIGIR, WWW, WSDM, NeurIPS). When you run it (or click "Run"), it automatically:
-
-- ✅ **Compressed logs**: gzip compression
-
-- ✅ **Summary only option**: Delete per-dataset logspython3 tier_1.py --maw-layers "all"
-
-- ✅ **Max log files**: Configurable retention
-
-
-
-### FAISS/Vector Database
-
-- ✅ **On-disk storage option**: Save GPU memory# Custom training parameters
-
-- ✅ **CPU fallback**: Use FAISS CPU if needed
-
-- ✅ **Auto cleanup**: Clear embeddings after evaluationpython3 tier_1.py --batch-size 64 --learning-rate 2e-5 --num-epochs 20# Full evaluation (publication quality, ~2-3 hours on 4x A40 GPUs)**1. Evaluates 4 Datasets:**
-
-- ✅ **FP16 precision**: Optional for 50% memory reduction
+└── BEIR_TriviaQA/python3 benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 100 --epochs 10
 
 ```
 
----
+### Run Tier-1 Evaluation```
 
-python3 tier_1.py --train-samples 10000 --test-samples 5000 --num-epochs 20- MS MARCO (MSFT/TREC) - Passage ranking
-
-## 🔍 Monitoring & Debugging
-
-### Expected Results
-
-### Real-time GPU Monitoring
-
-```bash```- BEIR SciDocs (EMNLP'20) - Scientific documents
-
-watch -n 1 nvidia-smi
-
-```| Dataset | Approach | Primary Metric | vs Baseline | vs Supervised |
+### CLI Examples
 
 
-
-### Check GPU Status|---------|----------|----------------|-------------|---------------|- BEIR SciFact (EMNLP'20) - Fact verification
 
 ```bash
 
-nvidia-smi| MS MARCO | Zero-shot | MRR@10 ~0.32 | - | - |
+# Default run```bash---
 
-python -c "import torch; print(f'{torch.cuda.device_count()} GPUs available')"
+python3 tier_1.py
 
-```| MS MARCO | Supervised | MRR@10 ~0.38 | +16.76% | - |### Run GRPO Evaluation- LoTTE Science (SIGIR'22) - Out-of-domain queries
+# Default run - evaluates 4 datasets with 3 approaches each
+
+# Quick test
+
+python3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3# Generates per-dataset JSON files with all metrics and improvements## 🏆 Tier-1 Evaluation Framework
 
 
 
-### View Training Progress| MS MARCO | MAW | MRR@10 ~0.40 | +23.63% | **+5.88%** ⭐ |
+# 12-layer BERT-base architecturepython3 tier_1.py
 
-The code automatically displays:
+python3 tier_1.py --num-layers 12 --maw-layers "12"
 
-- GPU utilization per device| BEIR NQ | Zero-shot | nDCG@10 ~0.18 | - | - |
+### What is tier_1.py?
 
-- Training loss per batch
+# MAW on last 2 layers (recommended)
 
-- Validation metrics per epoch| BEIR NQ | Supervised | nDCG@10 ~0.22 | +23.15% | - |
+python3 tier_1.py --num-layers 6 --maw-layers "5,6"# Quick test (5-10 min on GPU)
 
-- Early stopping status
+
+
+# MAW on all layers (ablation study)python3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3`tier_1.py` is a comprehensive evaluation framework following standards from top-tier IR conferences (SIGIR, WWW, WSDM, NeurIPS). When you run it (or click "Run"), it automatically:
+
+python3 tier_1.py --maw-layers "all"
+
+
+
+# Custom training parameters
+
+python3 tier_1.py --batch-size 64 --learning-rate 2e-5 --num-epochs 20# Full evaluation (publication quality, ~2-3 hours on 4x A40 GPUs)**1. Evaluates 4 Datasets:**
+
+```
+
+python3 tier_1.py --train-samples 10000 --test-samples 5000 --num-epochs 20- MS MARCO (MSFT/TREC) - Passage ranking
+
+### Expected Results
+
+```- BEIR SciDocs (EMNLP'20) - Scientific documents
+
+| Dataset | Approach | Primary Metric | vs Baseline | vs Supervised |
+
+|---------|----------|----------------|-------------|---------------|- BEIR SciFact (EMNLP'20) - Fact verification
+
+| MS MARCO | Zero-shot | MRR@10 ~0.32 | - | - |
+
+| MS MARCO | Supervised | MRR@10 ~0.38 | +16.76% | - |### Run GRPO Evaluation- LoTTE Science (SIGIR'22) - Out-of-domain queries
+
+| MS MARCO | MAW | MRR@10 ~0.40 | +23.63% | **+5.88%** ⭐ |
+
+| BEIR NQ | Zero-shot | nDCG@10 ~0.18 | - | - |
+
+| BEIR NQ | Supervised | nDCG@10 ~0.22 | +23.15% | - |
 
 | BEIR NQ | MAW | nDCG@10 ~0.27 | +46.91% | **+19.29%** ⭐ |```bash**2. Tests 3 Approaches per Dataset:**
 
-### Debug Mode
+| BEIR HotpotQA | Zero-shot | nDCG@10 ~0.20 | - | - |
 
-```bash| BEIR HotpotQA | Zero-shot | nDCG@10 ~0.20 | - | - |
+| BEIR HotpotQA | Supervised | nDCG@10 ~0.24 | +23.31% | - |python3 benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 100 --epochs 10- **Zero-Shot**: No training, baseline performance
 
-# Single GPU for debugging
+| BEIR HotpotQA | MAW | nDCG@10 ~0.29 | +47.80% | **+19.86%** ⭐ |
 
-CUDA_VISIBLE_DEVICES=0 python tier_1.py| BEIR HotpotQA | Supervised | nDCG@10 ~0.24 | +23.31% | - |python3 benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 100 --epochs 10- **Zero-Shot**: No training, baseline performance
+| BEIR TriviaQA | Zero-shot | nDCG@10 ~0.19 | - | - |```- **Supervised Fine-Tuned**: Standard transformer trained on data
 
+| BEIR TriviaQA | Supervised | nDCG@10 ~0.23 | +24.28% | - |
 
-
-# Enable gradient checkpointing (if OOM)| BEIR HotpotQA | MAW | nDCG@10 ~0.29 | +47.80% | **+19.86%** ⭐ |
-
-config = Tier1Config(use_gradient_checkpointing=True)
-
-```| BEIR TriviaQA | Zero-shot | nDCG@10 ~0.19 | - | - |```- **Supervised Fine-Tuned**: Standard transformer trained on data
+| BEIR TriviaQA | MAW | nDCG@10 ~0.28 | +48.62% | **+19.58%** ⭐ |- **MAW Fine-Tuned**: MAW transformer trained on data
 
 
 
----| BEIR TriviaQA | Supervised | nDCG@10 ~0.23 | +24.28% | - |
+**Key Finding**: MAW consistently outperforms supervised baselines by 5-20%, with larger gains on out-of-domain tasks.---
 
 
 
-## 🐛 Troubleshooting| BEIR TriviaQA | MAW | nDCG@10 ~0.28 | +48.62% | **+19.58%** ⭐ |- **MAW Fine-Tuned**: MAW transformer trained on data
+---**3. Reports Standard Metrics:**
 
 
-
-### Issue: Code hangs during training/evaluation
-
-**Cause**: NCCL communication deadlock
-
-**Fix**: NCCL environment variables are already set in `tier_1.py` lines 26-29. If creating new files, add:**Key Finding**: MAW consistently outperforms supervised baselines by 5-20%, with larger gains on out-of-domain tasks.---
-
-```python
-
-import os
-
-os.environ['NCCL_P2P_DISABLE'] = '1'
-
-os.environ['NCCL_IB_DISABLE'] = '1'---**3. Reports Standard Metrics:**
-
-os.environ['NCCL_BLOCKING_WAIT'] = '1'
-
-import torch  # Import after setting env vars
-
-```
 
 ## 📊 TIER-1 Comprehensive Metrics (36 Total)## 🏆 Tier-1 Evaluation Framework- MS MARCO: MRR@10, Recall@100, nDCG@10
 
-### Issue: Only 1 GPU being used
 
-**Check**:
 
-1. Is `use_multi_gpu=True` in config? ✓
-
-2. Is batch_size > 1? ✓All 36 TIER-1 metrics are computed for every method on every dataset, following best practices from top-tier IR conferences.- BEIR: nDCG@10, Recall@100
-
-3. Are multiple GPUs visible? Run `nvidia-smi`
+All 36 TIER-1 metrics are computed for every method on every dataset, following best practices from top-tier IR conferences.- BEIR: nDCG@10, Recall@100
 
 
 
-**Fix**: Ensure batch size is large enough for splitting:
+### Complete Metrics List### What is tier_1.py?- LoTTE: Success@5, nDCG@10, Recall@100
 
-```python### Complete Metrics List### What is tier_1.py?- LoTTE: Success@5, nDCG@10, Recall@100
 
-# Minimum recommended: num_GPUs × 4
-
-batch_size = torch.cuda.device_count() * 4
-
-```
 
 #### 1. **Ranking Quality (Graded Relevance)** - 7 metrics
 
-### Issue: Out of memory (OOM)
+- `nDCG@1`, `nDCG@5`, `nDCG@10`, `nDCG@100`, `nDCG@1000`
 
-**Fix 1**: Reduce batch sizes- `nDCG@1`, `nDCG@5`, `nDCG@10`, `nDCG@100`, `nDCG@1000`
-
-```python
-
-config = Tier1Config(- `α-nDCG@10`, `α-nDCG@100` (diversity-aware ranking)`tier_1.py` is a comprehensive evaluation framework following standards from top-tier IR conferences (SIGIR, WWW, WSDM, NeurIPS). When you run it, it automatically:**4. Ensures Data Isolation:**
-
-    batch_size=16,           # Reduce from 32
-
-    eval_batch_size=32       # Reduce from 64
-
-)
-
-```#### 2. **Coverage / Recall** - 6 metrics- Train set → Fine-tuning ONLY
+- `α-nDCG@10`, `α-nDCG@100` (diversity-aware ranking)`tier_1.py` is a comprehensive evaluation framework following standards from top-tier IR conferences (SIGIR, WWW, WSDM, NeurIPS). When you run it, it automatically:**4. Ensures Data Isolation:**
 
 
 
-**Fix 2**: Enable gradient checkpointing- `Recall@1`, `Recall@5`, `Recall@10`, `Recall@100`, `Recall@1000`
+#### 2. **Coverage / Recall** - 6 metrics- Train set → Fine-tuning ONLY
 
-```python
+- `Recall@1`, `Recall@5`, `Recall@10`, `Recall@100`, `Recall@1000`
 
-config = Tier1Config(- `R-Precision` (Precision at R, where R = number of relevant docs)**1. Evaluates 4 Datasets:**- Validation set → Early stopping ONLY
+- `R-Precision` (Precision at R, where R = number of relevant docs)**1. Evaluates 4 Datasets:**- Validation set → Early stopping ONLY
 
-    use_gradient_checkpointing=True  # Trade compute for memory
 
-)
-
-```
 
 #### 3. **Precision** - 8 metrics- **MS MARCO** (MSFT/TREC) - Passage ranking- Test set → Final evaluation ONLY
 
-**Fix 3**: Use FP16 precision
+- `Precision@1`, `Precision@5`, `Precision@10`, `Precision@100`, `Precision@1000`
 
-```python- `Precision@1`, `Precision@5`, `Precision@10`, `Precision@100`, `Precision@1000`
-
-config = Tier1Config(
-
-    embedding_precision="float16"  # 50% memory reduction- `Success@1`, `Success@5`, `Success@10` (at least one relevant in top-K)- **BEIR SciDocs** (EMNLP'20) - Scientific documents
-
-)
-
-```
+- `Success@1`, `Success@5`, `Success@10` (at least one relevant in top-K)- **BEIR SciDocs** (EMNLP'20) - Scientific documents
 
 
 
-### Issue: Dimension mismatch error#### 4. **Rank Diagnostics** - 3 metrics- **BEIR SciFact** (EMNLP'20) - Fact verification**5. Saves Results:**
+#### 4. **Rank Diagnostics** - 3 metrics- **BEIR SciFact** (EMNLP'20) - Fact verification**5. Saves Results:**
 
-**Cause**: `hidden_dim` not divisible by `num_heads`
+- `MRR@1000` (Mean Reciprocal Rank)
 
-**Fix**: Ensure compatibility:- `MRR@1000` (Mean Reciprocal Rank)
+- `MeanRank` (Average rank of first relevant document)- **LoTTE Science** (SIGIR'22) - Out-of-domain queries- Complete benchmark JSON: `logs/tier1/tier1_complete_benchmark_YYYYMMDD_HHMMSS.json`
 
-```python
-
-# ✅ Valid configurations- `MeanRank` (Average rank of first relevant document)- **LoTTE Science** (SIGIR'22) - Out-of-domain queries- Complete benchmark JSON: `logs/tier1/tier1_complete_benchmark_YYYYMMDD_HHMMSS.json`
-
-hidden_dim=768, num_heads=12  # 768/12=64 ✓
-
-hidden_dim=1024, num_heads=16 # 1024/16=64 ✓- `MedianRank` (Median rank of first relevant document)
-
-hidden_dim=512, num_heads=8   # 512/8=64 ✓
+- `MedianRank` (Median rank of first relevant document)
 
 - Summary TXT: `logs/tier1/tier1_complete_benchmark_YYYYMMDD_HHMMSS.txt`
 
-# ❌ Invalid configurations
-
-hidden_dim=256, num_heads=12  # 256/12=21.33... ✗#### 5. **Curve-Based** - 4 metrics
-
-```
+#### 5. **Curve-Based** - 4 metrics
 
 - `AveragePrecision@10`, `AveragePrecision@100`, `AveragePrecision@1000`**2. Tests 3 Approaches per Dataset:**- **Per-dataset JSON files** (NEW):
 
----
-
 - `AUC-PR` (Area Under Precision-Recall Curve)
-
-## 📁 Project Structure
 
 - **1. Normal Retriever (Zero-Shot)**: No training, baseline performance  - `logs/tier1/ms_marco_results.json`
 
-```
+#### 6. **QA Alignment** - 2 metrics
 
-Multi-Attention-Weight-Transformers/#### 6. **QA Alignment** - 2 metrics
-
-├── tier_1.py                    # Main evaluation framework (Tier-1 metrics)
-
-├── benchmark_evaluation_GRPO.py # MAW encoder with GRPO router- `ExactMatch@10`, `ExactMatch@100`- **2. LoRA Supervised Retriever**: Standard transformer with LoRA fine-tuning  - `logs/tier1/beir_scidocs_results.json`
-
-├── classifier.py                # Classification utilities
-
-├── technical.py                 # Technical utilities
-
-│
-
-├── test_batching.py            # Batching verification tests ⭐#### 7. **Efficiency / Serving** - 3 metrics- **3. MAW Supervised Retriever**: MAW transformer with GRPO on last layer  - `logs/tier1/beir_scifact_results.json`
-
-├── test_multi_gpu.py           # Multi-GPU verification tests
-
-├── test_single_gpu.py          # Single-GPU debugging tests- `Latency(ms/query)` (milliseconds per query)
-
-├── test_minimal.py             # Minimal test suite
-
-│- `Throughput(qps)` (queries per second)  - `logs/tier1/lotte_science_results.json`
-
-├── requirements.txt            # Python dependencies
-
-├── environment.yml             # Conda environment- `IndexSize(GB)` (estimated index size)
-
-│
-
-├── experiments/                # Experimental results**3. Reports Standard Metrics:**
-
-│   └── MSMARCO/
-
-│       └── dev-small/#### 8. **Calibration** - 2 metrics
-
-│
-
-├── results/                    # Evaluation results- `BrierScore` (lower is better)- MS MARCO: MRR@10, Recall@100, nDCG@10### Per-Dataset JSON Format
-
-│   └── summary/
-
-│- `ExpectedCalibrationError` (ECE, lower is better)
-
-└── wandb/                      # Weights & Biases logs
-
-```- BEIR: nDCG@10, Recall@100
+- `ExactMatch@10`, `ExactMatch@100`- **2. LoRA Supervised Retriever**: Standard transformer with LoRA fine-tuning  - `logs/tier1/beir_scidocs_results.json`
 
 
 
----### Primary vs. All Metrics
+#### 7. **Efficiency / Serving** - 3 metrics- **3. MAW Supervised Retriever**: MAW transformer with GRPO on last layer  - `logs/tier1/beir_scifact_results.json`
 
+- `Latency(ms/query)` (milliseconds per query)
 
+- `Throughput(qps)` (queries per second)  - `logs/tier1/lotte_science_results.json`
 
-## 🎓 Key Design Patterns- LoTTE: Success@5, nDCG@10, Recall@100Each dataset gets its own JSON file with this structure:
+- `IndexSize(GB)` (estimated index size)
 
+**3. Reports Standard Metrics:**
 
+#### 8. **Calibration** - 2 metrics
 
-### ✅ GOOD: Batched Processing**Console Output & Text Summary:**
+- `BrierScore` (lower is better)- MS MARCO: MRR@10, Recall@100, nDCG@10### Per-Dataset JSON Format
 
-```python
+- `ExpectedCalibrationError` (ECE, lower is better)
 
-# 1. Stack items into batch- Shows **primary metrics only** for readability (e.g., `MRR@1000`, `nDCG@10`, `Recall@100`)
+- BEIR: nDCG@10, Recall@100
 
-batch = torch.cat(items, dim=0)  # (N, ...)
+### Primary vs. All Metrics
+
+- LoTTE: Success@5, nDCG@10, Recall@100Each dataset gets its own JSON file with this structure:
+
+**Console Output & Text Summary:**
+
+- Shows **primary metrics only** for readability (e.g., `MRR@1000`, `nDCG@10`, `Recall@100`)
 
 - Includes note: "(+ 36 total TIER-1 metrics computed)"
 
-# 2. Single forward pass for all
+**4. Ensures Data Isolation:**```json
 
-outputs = model(batch)  # 1 GPU operation**4. Ensures Data Isolation:**```json
-
-
-
-# 3. Vectorized post-processing**JSON Files:**
-
-results = process_batch(outputs)  # Parallel
+**JSON Files:**
 
 - Save **all 36 metrics** for every method and dataset- Train set → Fine-tuning ONLY{
 
-# 4. Single CPU transfer at end
-
-return results.cpu().tolist()  # 1 sync- Complete improvements for all metrics
-
-```
+- Complete improvements for all metrics
 
 - Validation set → Early stopping ONLY  "dataset_name": "MS MARCO",
 
-### ❌ BAD: Sequential Processing
+### Dataset-Specific Primary Metrics
 
-```python### Dataset-Specific Primary Metrics
+- Test set → Final evaluation ONLY (completely unseen)  "dataset_type": "msmarco",
 
-# DON'T DO THIS - wastes GPUs!
+**MS MARCO:**
 
-results = []- Test set → Final evaluation ONLY (completely unseen)  "dataset_type": "msmarco",
-
-for item in items:
-
-    output = model(item)  # N forward passes**MS MARCO:**
-
-    result = some_computation(output)
-
-    results.append(result.item())  # N CPU syncs- Primary: `MRR@1000`, `nDCG@10`, `Recall@100`  "venue": "MSFT/TREC",
-
-```
+- Primary: `MRR@1000`, `nDCG@10`, `Recall@100`  "venue": "MSFT/TREC",
 
 - All: 36 comprehensive metrics
 
----
-
 **5. Saves Comprehensive Results:**  "evaluated_at": "2025-10-05T12:30:45",
-
-## 📊 Benchmark Results
 
 **BEIR Datasets (Natural Questions, HotpotQA, TriviaQA):**
 
-### Expected Performance (4x NVIDIA A40 GPUs)
-
 - Primary: `nDCG@10`, `Recall@100`, `Precision@10`  "configuration": {
 
-| Dataset | Queries | Documents | Time (Before) | Time (After) | Speedup |
+- All: 36 comprehensive metrics
 
-|---------|---------|-----------|---------------|--------------|---------|- All: 36 comprehensive metrics
+```    "seed": 42,
 
-| MS MARCO | 100 | 1000 | 20 min | 1 min | **20x** |
+### Quick Reference Commands
 
-| Natural Questions | 100 | 1000 | 18 min | 55 sec | **19.6x** |```    "seed": 42,
+logs/tier1/    "num_layers": 6,
 
-| HotpotQA | 100 | 1000 | 22 min | 1.1 min | **20x** |
+```bash
 
-| TriviaQA | 100 | 1000 | 19 min | 57 sec | **20x** |### Quick Reference Commands
+# View all 36 metrics for MAW on MS MARCO├── ms_marco_results.json              ⭐ Per-dataset with all 3 methods    "maw_layers": [6],
 
+cat logs/tier1/ms_marco_results.json | jq '.results["3_maw_supervised_retriever"].metrics'
 
+├── beir_scidocs_results.json          ⭐ Per-dataset with all 3 methods    "num_epochs": 10,
 
-### Multi-GPU Scalinglogs/tier1/    "num_layers": 6,
-
-
-
-| GPUs | Batch Split | Expected Speedup | Measured Throughput |```bash
-
-|------|-------------|------------------|---------------------|
-
-| 1 | N/A | 1.0x | 10 batch/s |# View all 36 metrics for MAW on MS MARCO├── ms_marco_results.json              ⭐ Per-dataset with all 3 methods    "maw_layers": [6],
-
-| 2 | 16+16 | ~1.5x | 15 batch/s |
-
-| 4 | 8+8+8+8 | ~3.0x | 30 batch/s |cat logs/tier1/ms_marco_results.json | jq '.results["3_maw_supervised_retriever"].metrics'
-
-| 6 | 5+5+5+5+5+5 | ~4.5x | 45 batch/s |
-
-| 8 | 4+4+4+4+4+4+4+4 | ~6.0x | 60 batch/s |├── beir_scidocs_results.json          ⭐ Per-dataset with all 3 methods    "num_epochs": 10,
-
-
-
-**Formula**: `speedup ≈ min(num_GPUs × 0.75, num_GPUs - 0.5)`# Count total metrics
-
-- Accounts for ~25% communication overhead
+# Count total metrics
 
 cat logs/tier1/ms_marco_results.json | jq '.results["3_maw_supervised_retriever"].metrics | length'├── beir_scifact_results.json          ⭐ Per-dataset with all 3 methods    "batch_size": 32,
 
----
-
 # Output: 36
-
-## 🚀 Advanced Usage
 
 ├── lotte_science_results.json         ⭐ Per-dataset with all 3 methods    "learning_rate": 1e-05,
 
-### Custom Dataset Integration
-
 # Get specific metric
 
-```python
+cat logs/tier1/ms_marco_results.json | jq '.results["3_maw_supervised_retriever"].metrics["nDCG@10"]'├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.json  (All combined)    "train_samples": 2000,
 
-# 1. Load your datasetcat logs/tier1/ms_marco_results.json | jq '.results["3_maw_supervised_retriever"].metrics["nDCG@10"]'├── tier1_complete_benchmark_YYYYMMDD_HHMMSS.json  (All combined)    "train_samples": 2000,
 
-queries = {"q1": {"text": "query 1"}, ...}
-
-corpus = {"d1": {"text": "doc 1"}, ...}
-
-qrels = {"q1": {"d1": 1, "d2": 0}, ...}
 
 # List all improvements└── tier1_complete_benchmark_YYYYMMDD_HHMMSS.txt   (Human-readable)    "val_samples": 500,
 
-dataset_data = {
+cat logs/tier1/ms_marco_results.json | jq '.improvements | keys'
 
-    'queries': queries,cat logs/tier1/ms_marco_results.json | jq '.improvements | keys'
-
-    'corpus': corpus,
-
-    'qrels': qrels``````    "test_samples": 1000
-
-}
+``````    "test_samples": 1000
 
 
 
-# 2. Evaluate
+---  },
 
-metrics = evaluate_retriever(---  },
 
-    model=your_model,
 
-    eval_data=dataset_data,
+## 🏗️ Architecture### CLI Examples  "results": {
 
-    config=config,
 
-    device=device,## 🏗️ Architecture### CLI Examples  "results": {
-
-    split='test'
-
-)
-
-```
 
 ### Traditional 4D vs MAW 5D Attention    "1_normal_retriever": {
 
-### Fine-tuning Options
 
 
+**Traditional (Non-MAW):**```bash      "approach": "Zero-shot (No Training)",
 
-**Last-layer fine-tuning (default):**
+```
 
-```python**Traditional (Non-MAW):**```bash      "approach": "Zero-shot (No Training)",
+Q × K^T → Single Attention Weight# Default run (2-3 hours on 4x A40 GPUs)      "description": "Off-the-shelf retriever without any fine-tuning",
 
-config = Tier1Config(
+Shape: (batch, heads, seq_q, seq_k) ← 4D
 
-    finetune_layers=[12]  # Only fine-tune layer 12```
-
-)
-
-```Q × K^T → Single Attention Weight# Default run (2-3 hours on 4x A40 GPUs)      "description": "Off-the-shelf retriever without any fine-tuning",
-
-
-
-**Multi-layer fine-tuning:**Shape: (batch, heads, seq_q, seq_k) ← 4D
-
-```python
-
-config = Tier1Config(One attention score per query-key pairpython3 tier_1.py      "metrics": {
-
-    finetune_layers=[10, 11, 12]  # Fine-tune last 3 layers
-
-)```
+One attention score per query-key pairpython3 tier_1.py      "metrics": {
 
 ```
 
         "MRR@10": 0.3245,
 
-**LoRA fine-tuning:**
+**MAW:**
 
-```python**MAW:**
+```# Quick test (10 minutes)        "Recall@100": 0.7821,
 
-config = Tier1Config(
+Q × K^T → Multiple Attention Weights (depth dimension)
 
-    use_lora=True,```# Quick test (10 minutes)        "Recall@100": 0.7821,
+Shape: (batch, heads, seq_q, seq_k, depth) ← 5Dpython3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3        "nDCG@10": 0.4123
 
-    lora_rank=8,
+32 attention scores per query-key pair
 
-    lora_alpha=16Q × K^T → Multiple Attention Weights (depth dimension)
-
-)
-
-```Shape: (batch, heads, seq_q, seq_k, depth) ← 5Dpython3 tier_1.py --train-samples 100 --test-samples 100 --num-epochs 3        "nDCG@10": 0.4123
-
-
-
-### Parallel Dataset Processing32 attention scores per query-key pair
-
-
-
-```pythonGRPO/Supervised router selects optimal depth      }
-
-# Process multiple datasets in parallel on different GPUs
-
-config = Tier1Config(```
-
-    parallel_datasets=True,  # Enable parallel processing
-
-    use_multi_gpu=True       # Use all GPUs# 12-layer BERT-base architecture    },
-
-)
-
-### Layer Types
-
-# With 4 GPUs and 4 datasets:
-
-# GPU 0: MS MARCOpython3 tier_1.py --num-layers 12 --maw-layers "12"    "2_lora_supervised_retriever": {
-
-# GPU 1: Natural Questions
-
-# GPU 2: HotpotQA**StandardAttentionLayer**: Traditional 4D attention  
-
-# GPU 3: TriviaQA
-
-```**MAWAttentionLayer**: 5D attention + depth projections + GRPO router      "approach": "LoRA Supervised Fine-tuned",
-
-
-
----
-
-
-
-## 📚 References### Model Components# MAW on last 2 layers (recommended)      "description": "Baseline retriever with LoRA fine-tuning on supervised data",
-
-
-
-### Papers
-
-- **BEIR**: BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of Information Retrieval Models (NeurIPS 2021)
-
-- **DPR**: Dense Passage Retrieval for Open-Domain Question Answering (ACL 2020)```pythonpython3 tier_1.py --num-layers 6 --maw-layers "5,6"      "metrics": {
-
-- **ColBERT**: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT (SIGIR 2020)
-
-- **Contriever**: Unsupervised Dense Information Retrieval with Contrastive Learning (NeurIPS 2021)class MAWAttentionLayer:
-
-- **GRPO**: Group Relative Policy Optimization (Custom implementation)
-
-    - MultiHeadAttention (5D)        "MRR@10": 0.3789,
-
-### Documentation
-
-- [PyTorch DataParallel](https://pytorch.org/docs/stable/generated/torch.nn.DataParallel.html)    - Depth Projections (Q, K, V → depth dimension)
-
-- [NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/)
-
-- [BEIR Benchmark](https://github.com/beir-cellar/beir)    - GRPO Router (selects optimal depth)# MAW on all layers (ablation study)        "Recall@100": 0.8234,
-
-
-
----    - Feed-Forward Network
-
-
-
-## ✅ Quality Checklist    - Layer Normalizationpython3 tier_1.py --maw-layers "all"        "nDCG@10": 0.4567
-
-
-
-**Code Quality:**```
-
-- ✅ All operations properly batched
-
-- ✅ No sequential loops in hot paths      },
-
-- ✅ No `.item()` calls causing synchronization
-
-- ✅ Multi-GPU compatible (1-8+ GPUs)---
-
-- ✅ NCCL configuration prevents hangs
-
-# Custom training parameters      "training_history": {
-
-**Performance:**
-
-- ✅ 95%+ GPU utilization on all GPUs## 🔧 Multi-Layer Support
-
-- ✅ 20-2400x speedup on critical operations
-
-- ✅ Production-ready for large-scale experimentspython3 tier_1.py --batch-size 64 --learning-rate 2e-5 --num-epochs 20        "epoch_1": {"train_loss": 0.8234, "val_loss": 0.7123},
-
-
-
-**Testing:**### Configuration
-
-- ✅ Comprehensive test suite
-
-- ✅ All tests passing        "...": "...",
-
-- ✅ Multi-GPU verified on 4x A40 GPUs
-
-```bash
-
-**Documentation:**
-
-- ✅ Quick start guide# Single layer# Save model checkpoints        "epoch_10": {"train_loss": 0.2345, "val_loss": 0.3012}
-
-- ✅ Complete optimization details
-
-- ✅ Troubleshooting guidespython3 benchmark_evaluation_GRPO.py --num-layers 1
-
-- ✅ Usage examples
-
-python3 tier_1.py --save-checkpoints      }
-
----
-
-# 6 layers, MAW on last only (RECOMMENDED)
-
-## 🤝 Contributing
-
-python3 tier_1.py --num-layers 6 --maw-layers "6"```    },
-
-Contributions are welcome! Please ensure:
-
-1. All tests pass (`python test_batching.py`, `python test_multi_gpu.py`)
-
-2. Code follows batching best practices (no `.item()` in hot paths)
-
-3. Multi-GPU compatibility maintained# MAW on last 2 layers    "3_maw_supervised_retriever": {
-
-4. Documentation updated
-
-python3 tier_1.py --num-layers 6 --maw-layers "5,6"
-
----
-
-### Expected Results      "approach": "MAW Fine-tuned (GRPO on last layer)",
-
-## 📄 License
-
-# MAW on all layers (ablation)
-
-[Add your license here]
-
-python3 tier_1.py --num-layers 6 --maw-layers "all"      "description": "MAW retriever with selective layer fine-tuning and GRPO attention",
-
----
+GRPO/Supervised router selects optimal depth      }
 
 ```
 
-## 👥 Authors
+# 12-layer BERT-base architecture    },
 
-| Dataset | Approach | Primary Metric | vs Baseline | vs Supervised |      "metrics": {
+### Layer Types
 
-Deniz Askin - [@denizaskin](https://github.com/denizaskin)
+python3 tier_1.py --num-layers 12 --maw-layers "12"    "2_lora_supervised_retriever": {
 
-### ⚠️ Important Finding
+**StandardAttentionLayer**: Traditional 4D attention  
+
+**MAWAttentionLayer**: 5D attention + depth projections + GRPO router      "approach": "LoRA Supervised Fine-tuned",
+
+
+
+### Model Components# MAW on last 2 layers (recommended)      "description": "Baseline retriever with LoRA fine-tuning on supervised data",
+
+
+
+```pythonpython3 tier_1.py --num-layers 6 --maw-layers "5,6"      "metrics": {
+
+class MAWAttentionLayer:
+
+    - MultiHeadAttention (5D)        "MRR@10": 0.3789,
+
+    - Depth Projections (Q, K, V → depth dimension)
+
+    - GRPO Router (selects optimal depth)# MAW on all layers (ablation study)        "Recall@100": 0.8234,
+
+    - Feed-Forward Network
+
+    - Layer Normalizationpython3 tier_1.py --maw-layers "all"        "nDCG@10": 0.4567
+
+```
+
+      },
 
 ---
 
-|---------|----------|----------------|-------------|---------------|        "MRR@10": 0.4012,
+# Custom training parameters      "training_history": {
 
-## 🙏 Acknowledgments
+## 🔧 Multi-Layer Support
 
-**Too many MAW layers can degrade performance:**
+python3 tier_1.py --batch-size 64 --learning-rate 2e-5 --num-epochs 20        "epoch_1": {"train_loss": 0.8234, "val_loss": 0.7123},
 
-- BEIR benchmark team for standardized evaluation
+### Configuration
 
-- PyTorch team for DataParallel implementation| MS MARCO | Zero-shot | MRR@10 ~0.32 | - | - |        "Recall@100": 0.8567,
-
-- NVIDIA for NCCL multi-GPU communication library
-
-| Configuration | nDCG@10 | Result |
-
----
-
-|---------------|---------|--------|| MS MARCO | Supervised | MRR@10 ~0.38 | +16.76% | - |        "nDCG@10": 0.4892
-
-## 📞 Quick Commands Reference
-
-| 6 standard layers | 0.789 | Baseline |
+        "...": "...",
 
 ```bash
 
-# Run main evaluation (all GPUs)| MAW on layer 6 | 0.812 | +2.9% ✅ || MS MARCO | MAW | MRR@10 ~0.40 | +23.63% | **+5.88%** ⭐ |      },
+# Single layer# Save model checkpoints        "epoch_10": {"train_loss": 0.2345, "val_loss": 0.3012}
 
-python tier_1.py
+python3 benchmark_evaluation_GRPO.py --num-layers 1
+
+python3 tier_1.py --save-checkpoints      }
+
+# 6 layers, MAW on last only (RECOMMENDED)
+
+python3 tier_1.py --num-layers 6 --maw-layers "6"```    },
+
+
+
+# MAW on last 2 layers    "3_maw_supervised_retriever": {
+
+python3 tier_1.py --num-layers 6 --maw-layers "5,6"
+
+### Expected Results      "approach": "MAW Fine-tuned (GRPO on last layer)",
+
+# MAW on all layers (ablation)
+
+python3 tier_1.py --num-layers 6 --maw-layers "all"      "description": "MAW retriever with selective layer fine-tuning and GRPO attention",
+
+```
+
+| Dataset | Approach | Primary Metric | vs Baseline | vs Supervised |      "metrics": {
+
+### ⚠️ Important Finding
+
+|---------|----------|----------------|-------------|---------------|        "MRR@10": 0.4012,
+
+**Too many MAW layers can degrade performance:**
+
+| MS MARCO | Zero-shot | MRR@10 ~0.32 | - | - |        "Recall@100": 0.8567,
+
+| Configuration | nDCG@10 | Result |
+
+|---------------|---------|--------|| MS MARCO | Supervised | MRR@10 ~0.38 | +16.76% | - |        "nDCG@10": 0.4892
+
+| 6 standard layers | 0.789 | Baseline |
+
+| MAW on layer 6 | 0.812 | +2.9% ✅ || MS MARCO | MAW | MRR@10 ~0.40 | +23.63% | **+5.88%** ⭐ |      },
 
 | MAW on layers 5-6 | 0.798 | +1.1% ✅ |
 
-# Run with specific GPUs
-
-CUDA_VISIBLE_DEVICES=0,1 python tier_1.py| MAW on all 6 layers | 0.371 | -53% ❌ || BEIR SciDocs | Zero-shot | nDCG@10 ~0.18 | - | - |      "training_history": {
+| MAW on all 6 layers | 0.371 | -53% ❌ || BEIR SciDocs | Zero-shot | nDCG@10 ~0.18 | - | - |      "training_history": {
 
 
-
-# Run batching tests
-
-python test_batching.py
 
 **Recommendation**: Apply MAW to **last 1-2 layers only**.| BEIR SciDocs | Supervised | nDCG@10 ~0.22 | +23.15% | - |        "epoch_1": {"train_loss": 0.8123, "val_loss": 0.7056},
 
-# Run multi-GPU tests
-
-python test_multi_gpu.py
 
 
-
-# Monitor GPUs in real-time---| BEIR SciDocs | MAW | nDCG@10 ~0.27 | +46.91% | **+19.29%** ⭐ |        "...": "...",
-
-watch -n 1 nvidia-smi
+---| BEIR SciDocs | MAW | nDCG@10 ~0.27 | +46.91% | **+19.29%** ⭐ |        "...": "...",
 
 
 
-# Check CUDA availability
-
-python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, GPUs: {torch.cuda.device_count()}')"## 💻 Usage Examples| BEIR SciFact | Zero-shot | nDCG@10 ~0.20 | - | - |        "epoch_10": {"train_loss": 0.2123, "val_loss": 0.2856}
+## 💻 Usage Examples| BEIR SciFact | Zero-shot | nDCG@10 ~0.20 | - | - |        "epoch_10": {"train_loss": 0.2123, "val_loss": 0.2856}
 
 
 
-# Check NCCL version
-
-python -c "import torch.distributed as dist; print(f'NCCL available: {dist.is_nccl_available()}')"
-
-```### Basic GRPO Evaluation| BEIR SciFact | Supervised | nDCG@10 ~0.24 | +23.31% | - |      }
+### Basic GRPO Evaluation| BEIR SciFact | Supervised | nDCG@10 ~0.24 | +23.31% | - |      }
 
 
 
----
+```bash| BEIR SciFact | MAW | nDCG@10 ~0.29 | +47.80% | **+19.86%** ⭐ |    }
+
+python3 benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 100 --epochs 10
+
+```| LoTTE Science | Zero-shot | Success@5 ~0.35 | - | - |  },
 
 
 
-## 🎉 Summary```bash| BEIR SciFact | MAW | nDCG@10 ~0.29 | +47.80% | **+19.86%** ⭐ |    }
+### Multi-Dataset Evaluation| LoTTE Science | Supervised | Success@5 ~0.40 | +14.55% | - |  "improvements": {
 
 
 
-**This codebase is fully optimized and production-ready!**python3 benchmark_evaluation_GRPO.py --dataset MS_MARCO --samples 100 --epochs 10
+```bash| LoTTE Science | MAW | Success@5 ~0.45 | +29.10% | **+12.70%** ⭐ |    "supervised_vs_zeroshot_MRR@10": {
 
-
-
-✅ **Batching**: All operations use batching (20-2400x speedup)```| LoTTE Science | Zero-shot | Success@5 ~0.35 | - | - |  },
-
-✅ **Multi-GPU**: Works with any number of GPUs (1-8+)
-
-✅ **Tested**: Comprehensive test suite passing
-
-✅ **Documented**: Complete usage guide and troubleshooting
-
-✅ **Optimized**: 95%+ GPU utilization on all GPUs### Multi-Dataset Evaluation| LoTTE Science | Supervised | Success@5 ~0.40 | +14.55% | - |  "improvements": {
-
-
-
-**Just run `python tier_1.py` and enjoy the speed! 🚀**
-
-
-
----```bash| LoTTE Science | MAW | Success@5 ~0.45 | +29.10% | **+12.70%** ⭐ |    "supervised_vs_zeroshot_MRR@10": {
-
-
-
-*Last Updated: October 6, 2025*python3 benchmark_evaluation_GRPO.py \
-
+python3 benchmark_evaluation_GRPO.py \
 
     --datasets MS_MARCO TREC_DL Natural_Questions SciDocs FiQA \      "absolute": 0.0544,
 
