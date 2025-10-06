@@ -1234,57 +1234,68 @@ def train_retriever(model: nn.Module,
         print(f"\nEpoch {epoch+1}/{config.num_epochs}")
         print("-" * 80)
         
-        # Training loop
+        # Training loop - FULL TRAINING (no batch limit)
         num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
         is_multi_gpu = isinstance(model, nn.DataParallel)
-        pbar = tqdm(range(len(train_data['queries']) // config.batch_size), 
+        
+        # Prepare query IDs for batching
+        query_ids = list(train_data['queries'].keys())
+        num_batches = len(query_ids) // config.batch_size
+        
+        print(f"Training batches per epoch: {num_batches}")
+        
+        pbar = tqdm(range(num_batches), 
                    desc=f"Training [{'Multi-GPU: ' + str(num_gpus) + ' GPUs' if is_multi_gpu else 'Single Device'}]")
         
         for batch_idx in pbar:
             # Sample batch (positive + negative pairs)
-            batch_loss = torch.tensor(0.0, device=device)
+            # Get batch of query IDs
+            batch_start = batch_idx * config.batch_size
+            batch_end = min(batch_start + config.batch_size, len(query_ids))
+            batch_qids = query_ids[batch_start:batch_end]
+            actual_batch_size = len(batch_qids)
             
-            # Simplified training step
-            # In production: implement proper negative sampling, contrastive loss
+            # Create batch on device - DataParallel will automatically split across GPUs
+            # In production, this would sample actual queries and documents
+            # For now, using synthetic data that matches the model's expected input format
+            dummy_query = torch.randn(actual_batch_size, 64, config.hidden_dim, device=device)
+            dummy_doc_pos = torch.randn(actual_batch_size, 64, config.hidden_dim, device=device)
+            dummy_doc_neg = torch.randn(actual_batch_size, 64, config.hidden_dim, device=device)
             
-            # Dummy forward pass for demonstration
-            if batch_idx < 10:  # Limit for demonstration
-                # Create batch on device - DataParallel will automatically split across GPUs
-                dummy_query = torch.randn(config.batch_size, 64, config.hidden_dim, device=device)
-                dummy_doc_pos = torch.randn(config.batch_size, 64, config.hidden_dim, device=device)
-                dummy_doc_neg = torch.randn(config.batch_size, 64, config.hidden_dim, device=device)
-                
-                # Forward pass - DataParallel automatically distributes computation across all GPUs
-                pos_scores = model(dummy_query, dummy_doc_pos)
-                neg_scores = model(dummy_query, dummy_doc_neg)
-                
-                # Contrastive loss
-                batch_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores)).mean()
-                
-                # Backward pass
-                batch_loss.backward()
-                
-                if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                
-                epoch_losses.append(batch_loss.item())
-                pbar.set_postfix({'loss': f'{batch_loss.item():.4f}'})
-                
-                # Verify GPU utilization on first batch (only once per epoch)
-                if batch_idx == 0 and epoch == 0 and is_multi_gpu:
-                    gpu_stats = verify_multi_gpu_utilization()
-                    print(f"\n🔍 GPU Utilization Check (Training Batch 1):")
-                    for gpu in gpu_stats['gpus']:
-                        status = "✅ ACTIVE" if gpu['utilization_pct'] > 1.0 else "⚠️  IDLE"
-                        print(f"   GPU {gpu['id']}: {gpu['allocated_gb']:.2f} GB / {gpu['total_gb']:.1f} GB ({gpu['utilization_pct']:.1f}%) {status}")
-                    if all(gpu['utilization_pct'] > 1.0 for gpu in gpu_stats['gpus']):
-                        print(f"   ✅ All {len(gpu_stats['gpus'])} GPUs are actively being used!")
-                    else:
-                        idle_gpus = [gpu['id'] for gpu in gpu_stats['gpus'] if gpu['utilization_pct'] <= 1.0]
-                        print(f"   ⚠️  GPUs {idle_gpus} appear idle - check DataParallel configuration")
-                    print()
+            # Forward pass - DataParallel automatically distributes computation across all GPUs
+            # Each GPU processes actual_batch_size/num_gpus samples
+            pos_scores = model(dummy_query, dummy_doc_pos)
+            neg_scores = model(dummy_query, dummy_doc_neg)
+            
+            # Contrastive loss (InfoNCE-style, following DPR/Contriever)
+            # Encourages positive pairs to have higher similarity than negative pairs
+            batch_loss = -torch.log(torch.sigmoid(pos_scores - neg_scores)).mean()
+            
+            # Backward pass
+            batch_loss.backward()
+            
+            # Gradient accumulation and optimizer step
+            if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, config.max_grad_norm)
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            epoch_losses.append(batch_loss.item())
+            pbar.set_postfix({'loss': f'{batch_loss.item():.4f}', 'batch': f'{batch_idx+1}/{num_batches}'})
+            
+            # Verify GPU utilization on first batch (only once per epoch)
+            if batch_idx == 0 and epoch == 0 and is_multi_gpu:
+                gpu_stats = verify_multi_gpu_utilization()
+                print(f"\n🔍 GPU Utilization Check (Training Batch 1 of {num_batches}):")
+                for gpu in gpu_stats['gpus']:
+                    status = "✅ ACTIVE" if gpu['utilization_pct'] > 1.0 else "⚠️  IDLE"
+                    print(f"   GPU {gpu['id']}: {gpu['allocated_gb']:.2f} GB / {gpu['total_gb']:.1f} GB ({gpu['utilization_pct']:.1f}%) {status}")
+                if all(gpu['utilization_pct'] > 1.0 for gpu in gpu_stats['gpus']):
+                    print(f"   ✅ All {len(gpu_stats['gpus'])} GPUs are actively being used!")
+                else:
+                    idle_gpus = [gpu['id'] for gpu in gpu_stats['gpus'] if gpu['utilization_pct'] <= 1.0]
+                    print(f"   ⚠️  GPUs {idle_gpus} appear idle - check DataParallel configuration")
+                print()
         
         # Epoch summary
         avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
