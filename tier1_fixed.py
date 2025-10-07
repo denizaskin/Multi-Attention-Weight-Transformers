@@ -1,46 +1,48 @@
 """
-Tier-1 Benchmark Pipeline (BEIR/MS MARCO/LoTTE compliant)
----------------------------------------------------------
+Tier-1 Benchmark Pipeline (MS MARCO/LoTTE - Training Sets Only)
+----------------------------------------------------------------
 
-This script replaces the toy baseline with a full evaluation pipeline that matches
-community expectations for information retrieval benchmarking:
+This script evaluates information retrieval with Multi-Attention-Weight (MAW) transformers
+on datasets that have training sets for fine-tuning.
 
-1. Real datasets and protocols
-   • MS MARCO train/dev/test via BEIR-compatible loaders
-   • BEIR datasets (default: nq, hotpotqa, scifact, fiqa)
-   • LoTTE (search + forum splits) via manual ir_datasets export (see setup script)
+1. Supported Datasets (with train sets):
+   • MS MARCO: train (502K queries), dev (7K queries), test (43 queries)
+   • LoTTE: search and forum splits with train/dev/test
+   
+   Note: BEIR datasets removed - they lack training sets and are zero-shot only
 
-2. Reference baselines
-   • Pyserini/Anserini BM25 with k1=0.9, b=0.4
-   • SentenceTransformer dense retrievers (Contriever by default)
-   • MAW variants layered on top of the dense encoder
+2. Model Variants:
+   • BM25 baseline (no training required)
+   • DenseZeroShot (pre-trained encoder, no fine-tuning)
+   • DenseLoRA (LoRA fine-tuning)
+   • MAWLoRA (LoRA + MAW on last layer)
+   • MAWFullFT (Full fine-tuning + MAW on last layer)
 
-3. Training with capacity matching
-   • Full fine-tuning with in-batch InfoNCE loss
-   • LoRA fine-tuning on attention/MLP blocks via PEFT
-   • Token-level MAW integration prior to pooling
-   • Budget accounting (trainable params, steps, batch tokens, wall-clock)
+3. MAW Features:
+   • 5D attention tensor: (batch, heads, seq_q, seq_k, depth)
+   • GRPO (Group Relative Policy Optimization) for depth selection
+   • Scaled by √depth_dim for numerical stability
+   • Layer-specific application (default: last layer only)
 
-4. Reference evaluation tooling
-   • Retrieval with full corpora, consistent top-K
-   • Metrics from pytrec_eval / BEIR EvaluateRetrieval
-   • Paired bootstrap significance tests using per-query scores
-
-5. Quality-of-life features
-   • --quick-smoke-test flag for a 2–3 minute shakedown on tiny slices
-   • Automatic dataset download (BEIR util, HuggingFace datasets)
-   • Optional caching of dense embeddings and Pyserini indices
+4. Training:
+   • Contrastive learning with in-batch negatives
+   • BM25 hard negatives
+   • LoRA or full fine-tuning options
+   • Proper train/dev/test split separation (no data leakage)
 
 Run examples
 ------------
-# Quick shakedown (~3 minutes, 64 queries/document subset per dataset)
-python tier1_fixed.py --quick-smoke-test
+# Quick test on MS MARCO (~5-10 minutes)
+python tier1_fixed.py --quick-smoke-test --msmarco
 
-# Full Tier-1 sweep (MS MARCO + BEIR + LoTTE)
-python tier1_fixed.py --msmarco --beir nq hotpotqa scifact fiqa --lotte search forum
+# Full MS MARCO evaluation
+python tier1_fixed.py --msmarco
 
-# Dense-only experiment on MS MARCO with LoRA rank 32
-python tier1_fixed.py --msmarco --dense-model facebook/contriever --lora-rank 32
+# LoTTE evaluation
+python tier1_fixed.py --lotte search forum
+
+# Both datasets
+python tier1_fixed.py --msmarco --lotte search
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ import argparse
 import collections
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -110,7 +113,7 @@ class BenchmarkConfig:
 
     top_k: int = 1000
     ms_marco: bool = False
-    beir_datasets: List[str] = field(default_factory=list)
+    # REMOVED: beir_datasets - BEIR datasets don't have train sets
     lotte_splits: List[str] = field(default_factory=list)
 
     data_root: str = "datasets"
@@ -332,35 +335,8 @@ class DatasetManager:
             dev_split = None
         return self._assemble_bundle(dataset_name, train_split, dev_split, test_split)
 
-    def get_beir_dataset(self, dataset: str) -> DatasetBundle:
-        dataset_path = self._ensure_beir_dataset(dataset, f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip")
-        train_split = self._try_load_split(dataset_path, dataset, ["train"])
-        dev_split = self._try_load_split(dataset_path, dataset, ["dev", "validation", "val"])
-        test_split = self._try_load_split(dataset_path, dataset, ["test"])
-        
-        # Fall back to dev ONLY for test if test doesn't exist AND we have no training data
-        # This prevents data leakage: if we use dev for test, we cannot use it for validation
-        if test_split is None and dev_split is not None:
-            logging.warning(
-                "%s: No test split found, using dev split for evaluation. "
-                "Dev split will NOT be used for validation to prevent data leakage.",
-                dataset
-            )
-            test_split = dev_split
-            dev_split = None  # Nullify dev to prevent using it for validation
-        
-        if test_split is None:
-            raise ValueError(f"Dataset '{dataset}' does not provide a test or dev split for evaluation.")
-        
-        # Additional safety check: ensure dev and test are different
-        if dev_split is not None and test_split[3] == dev_split[3]:
-            logging.warning(
-                "%s: Dev and test splits are identical. Nullifying dev split to prevent data leakage.",
-                dataset
-            )
-            dev_split = None
-            
-        return self._assemble_bundle(dataset, train_split, dev_split, test_split)
+    # REMOVED: get_beir_dataset() - BEIR datasets typically don't have train sets
+    # Only keeping datasets with train sets: MS MARCO and LoTTE
 
     def get_lotte_split(self, split: str) -> DatasetBundle:
         normalized = split.lower()
@@ -777,6 +753,10 @@ class TokenLevelMAW(nn.Module):
         # Step 3: Multiply query and key to get 5D attention tensor
         # Shape: (batch_size, num_heads, depth, seq_len_q, seq_len_k)
         attn_5d = torch.matmul(query_expanded, key_expanded)
+        
+        # Scale by sqrt(depth_dim) for numerical stability (similar to standard attention scaling)
+        scaling_factor = math.sqrt(self.depth_dim)
+        attn_5d = attn_5d / scaling_factor
         
         # Step 4: Transpose to put depth dimension last
         # From: (batch_size, num_heads, depth, seq_len_q, seq_len_k)
@@ -1696,8 +1676,7 @@ class BenchmarkRunner:
         set_random_seed(self.config.seed)
         if self.config.ms_marco:
             self._run_bundle(self.dataset_manager.get_msmarco())
-        for dataset in self.config.beir_datasets:
-            self._run_bundle(self.dataset_manager.get_beir_dataset(dataset))
+        # REMOVED: BEIR datasets loop - BEIR datasets don't have train sets
         for split in self.config.lotte_splits:
             self._run_bundle(self.dataset_manager.get_lotte_split(split))
         if is_main_process(self.config) and self.reports:
@@ -1987,8 +1966,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float, default=2e-5)
     parser.add_argument("--top-k", type=int, default=1000)
     parser.add_argument("--negatives-per-query", type=int, default=4)
-    parser.add_argument("--msmarco", action="store_true", help="Include MS MARCO dev evaluation")
-    parser.add_argument("--beir", nargs="*", default=[], help="List of BEIR datasets to evaluate")
+    parser.add_argument("--msmarco", action="store_true", help="Include MS MARCO evaluation")
+    # REMOVED: --beir argument - BEIR datasets don't have train sets
     parser.add_argument("--lotte", nargs="*", default=[], help="LoTTE splits (search/forum)")
     parser.add_argument("--quick-smoke-test", action="store_true", help="Run tiny smoke test subset")
     parser.add_argument("--seed", type=int, default=42)
@@ -2029,7 +2008,7 @@ def build_config(args: argparse.Namespace) -> BenchmarkConfig:
         top_k=args.top_k,
         negatives_per_query=args.negatives_per_query,
         ms_marco=args.msmarco,
-        beir_datasets=args.beir,
+        # REMOVED: beir_datasets - BEIR datasets don't have train sets
         lotte_splits=args.lotte,
         quick_smoke_test=args.quick_smoke_test,
         seed=args.seed,
@@ -2091,8 +2070,8 @@ def main() -> None:
         ",".join(f"cuda:{idx}" for idx in config.device_ids) if config.device_ids else "cpu",
     )
 
-    if not (config.ms_marco or config.beir_datasets or config.lotte_splits):
-        logging.info("No datasets specified; defaulting to MS MARCO dev")
+    if not (config.ms_marco or config.lotte_splits):
+        logging.info("No datasets specified; defaulting to MS MARCO")
         config.ms_marco = True
 
     runner = BenchmarkRunner(config)
