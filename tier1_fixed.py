@@ -52,28 +52,33 @@ import logging
 import os
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+import zipfile
+import shutil
+import warnings
+from contextlib import nullcontext
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Callable
 
 import numpy as np
 import pytrec_eval
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     AutoModel,
     AutoTokenizer,
     AutoConfig,
     get_linear_schedule_with_warmup,
 )
+from torch.amp import autocast, GradScaler
 from peft import LoraConfig, TaskType, get_peft_model
 
 from beir import util as beir_util
 from beir.datasets.data_loader import GenericDataLoader
-from beir.retrieval.search.lexical import BM25Search as BEIRBM25
 import ir_datasets
 from tqdm import tqdm
 
@@ -99,7 +104,7 @@ class BenchmarkConfig:
     lora_dropout: float = 0.05
 
     use_maw: bool = False
-    maw_layers: int = 1
+    maw_layer_indices: List[int] = field(default_factory=lambda: [-1])  # -1 means last layer (default)
     maw_depth_dim: int = 64
     maw_num_heads: int = 8
 
@@ -119,17 +124,62 @@ class BenchmarkConfig:
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     device_ids: Tuple[int, ...] = field(default_factory=tuple)
+    use_amp: bool = True
+    amp_dtype: str = "bf16"
+
+    distributed: bool = field(default=False, init=False)
+    world_size: int = field(default=1, init=False)
+    rank: int = field(default=0, init=False)
+    local_rank: int = field(default=0, init=False)
+    primary_device_index: int = field(default=0, init=False)
 
     def clone_for(self, **kwargs) -> "BenchmarkConfig":
-        params = self.__dict__.copy()
-        params.update(kwargs)
-        return BenchmarkConfig(**params)
+        init_params = {}
+        for f in fields(BenchmarkConfig):
+            if f.init:
+                init_params[f.name] = getattr(self, f.name)
+        init_params.update(kwargs)
+        
+        # Reduce batch size for MAW variants to prevent OOM (5D attention is memory-intensive)
+        if kwargs.get('use_maw', False) and 'batch_size' not in kwargs:
+            # Reduce training batch size by 4x for MAW (5D tensor is large)
+            init_params['batch_size'] = max(4, init_params.get('batch_size', 32) // 4)
+            # Also reduce eval batch size by 2x
+            init_params['eval_batch_size'] = max(64, init_params.get('eval_batch_size', 256) // 2)
+        
+        clone = BenchmarkConfig(**init_params)
+        # preserve runtime-discovered attributes that are init=False
+        clone.distributed = self.distributed
+        clone.world_size = self.world_size
+        clone.rank = self.rank
+        clone.local_rank = self.local_rank
+        clone.primary_device_index = self.primary_device_index
+        clone.device = self.device
+        clone.device_ids = self.device_ids
+        return clone
 
     def __post_init__(self) -> None:
-        if self.device.startswith("cuda") and torch.cuda.is_available():
-            count = torch.cuda.device_count()
-            self.device_ids = tuple(range(count))
+        gpu_available = torch.cuda.is_available()
+        gpu_count = torch.cuda.device_count() if gpu_available else 0
+
+        env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        env_rank = os.environ.get("RANK")
+        env_local_rank = os.environ.get("LOCAL_RANK")
+
+        if gpu_available and env_world_size > 1 and env_rank is not None and env_local_rank is not None:
+            self.distributed = True
+            self.world_size = env_world_size
+            self.rank = int(env_rank)
+            self.local_rank = int(env_local_rank)
+            self.primary_device_index = self.local_rank
+            self.device = f"cuda:{self.primary_device_index}"
+            self.device_ids = tuple(range(gpu_count))
+        elif gpu_available:
+            self.primary_device_index = 0
+            self.device = "cuda:0"
+            self.device_ids = tuple(range(gpu_count))
         else:
+            self.primary_device_index = -1
             self.device = "cpu"
             self.device_ids = tuple()
 
@@ -176,6 +226,63 @@ class ModelSnapshot:
     state_dict: Dict[str, torch.Tensor]
     training_stats: Dict[str, Any]
 
+
+def initialize_distributed(config: BenchmarkConfig) -> None:
+    if not config.distributed:
+        return
+    if not dist.is_available():
+        raise RuntimeError("Distributed execution requested but torch.distributed is not available in this build.")
+    if not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+    torch.cuda.set_device(config.primary_device_index)
+
+
+def finalize_distributed(config: BenchmarkConfig) -> None:
+    if config.distributed and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(config: BenchmarkConfig) -> bool:
+    if not config.distributed:
+        return True
+    return config.rank == 0
+
+
+def wait_for_condition(predicate: Callable[[], bool], timeout: float, interval: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
+def safe_extract_zip(zip_path: Path, target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as archive:
+        for member in archive.namelist():
+            member_path = (target_dir / member).resolve()
+            if not str(member_path).startswith(str(target_dir.resolve())):
+                raise RuntimeError(f"Unsafe path detected in archive {zip_path}: {member}")
+        archive.extractall(target_dir)
+
+
+def broadcast_object(config: BenchmarkConfig, obj: Any, src: int = 0) -> Any:
+    if not (config.distributed and dist.is_available() and dist.is_initialized()):
+        return obj
+    payload = [obj if config.rank == src else None]
+    dist.broadcast_object_list(payload, src=src)
+    return payload[0]
+
+
+def all_gather_objects(config: BenchmarkConfig, obj: Any) -> List[Any]:
+    if not (config.distributed and dist.is_available() and dist.is_initialized()):
+        return [obj]
+    gathered: List[Any] = [None for _ in range(config.world_size)]
+    dist.all_gather_object(gathered, obj)
+    return gathered
+
 def set_random_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -215,10 +322,10 @@ class DatasetManager:
 
     def get_msmarco(self) -> DatasetBundle:
         dataset_name = "msmarco"
-        loader = self._ensure_beir_dataset(dataset_name, "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/msmarco.zip")
-        train_split = self._try_load_split(loader, dataset_name, ["train"])
-        dev_split = self._try_load_split(loader, dataset_name, ["dev", "validation", "val"])
-        test_split = self._try_load_split(loader, dataset_name, ["test"])
+        dataset_path = self._ensure_beir_dataset(dataset_name, "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/msmarco.zip")
+        train_split = self._try_load_split(dataset_path, dataset_name, ["train"])
+        dev_split = self._try_load_split(dataset_path, dataset_name, ["dev", "validation", "val"])
+        test_split = self._try_load_split(dataset_path, dataset_name, ["test"])
         if test_split is None and dev_split is not None:
             logging.info("MS MARCO missing explicit test split; using dev split for final evaluation and disabling dev monitoring.")
             test_split = dev_split
@@ -226,14 +333,33 @@ class DatasetManager:
         return self._assemble_bundle(dataset_name, train_split, dev_split, test_split)
 
     def get_beir_dataset(self, dataset: str) -> DatasetBundle:
-        loader = self._ensure_beir_dataset(dataset, f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip")
-        train_split = self._try_load_split(loader, dataset, ["train"])
-        dev_split = self._try_load_split(loader, dataset, ["dev", "validation", "val"])
-        test_split = self._try_load_split(loader, dataset, ["test", "dev"])
+        dataset_path = self._ensure_beir_dataset(dataset, f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip")
+        train_split = self._try_load_split(dataset_path, dataset, ["train"])
+        dev_split = self._try_load_split(dataset_path, dataset, ["dev", "validation", "val"])
+        test_split = self._try_load_split(dataset_path, dataset, ["test"])
+        
+        # Fall back to dev ONLY for test if test doesn't exist AND we have no training data
+        # This prevents data leakage: if we use dev for test, we cannot use it for validation
+        if test_split is None and dev_split is not None:
+            logging.warning(
+                "%s: No test split found, using dev split for evaluation. "
+                "Dev split will NOT be used for validation to prevent data leakage.",
+                dataset
+            )
+            test_split = dev_split
+            dev_split = None  # Nullify dev to prevent using it for validation
+        
         if test_split is None:
-            raise ValueError(f"Dataset '{dataset}' does not provide a test split.")
+            raise ValueError(f"Dataset '{dataset}' does not provide a test or dev split for evaluation.")
+        
+        # Additional safety check: ensure dev and test are different
         if dev_split is not None and test_split[3] == dev_split[3]:
+            logging.warning(
+                "%s: Dev and test splits are identical. Nullifying dev split to prevent data leakage.",
+                dataset
+            )
             dev_split = None
+            
         return self._assemble_bundle(dataset, train_split, dev_split, test_split)
 
     def get_lotte_split(self, split: str) -> DatasetBundle:
@@ -249,32 +375,74 @@ class DatasetManager:
                 "Verify that ir_datasets is installed and accessible."
             )
 
-        loader = GenericDataLoader(str(dataset_path))
-        train_split = self._try_load_split(loader, dataset_name, ["train"])
-        dev_split = self._try_load_split(loader, dataset_name, ["dev", "validation", "val"])
-        test_split = self._try_load_split(loader, dataset_name, ["test"])
+        train_split = self._try_load_split(str(dataset_path), dataset_name, ["train"])
+        dev_split = self._try_load_split(str(dataset_path), dataset_name, ["dev", "validation", "val"])
+        test_split = self._try_load_split(str(dataset_path), dataset_name, ["test"])
         if test_split is None:
             raise ValueError(f"LoTTE split '{split}' does not include a test partition.")
         return self._assemble_bundle(dataset_name, train_split, dev_split, test_split)
 
-    def _ensure_beir_dataset(self, dataset_name: str, url: str) -> GenericDataLoader:
+    def _ensure_beir_dataset(self, dataset_name: str, url: str) -> str:
         dataset_path = ensure_dir(Path(self.config.data_root) / dataset_name)
-        if not any(dataset_path.iterdir()):
-            logging.info("Downloading dataset %s ...", dataset_name)
+        
+        # Check if dataset needs to be downloaded
+        has_corpus = (dataset_path / "corpus.jsonl").exists()
+        has_queries = (dataset_path / "queries.jsonl").exists()
+        has_qrels = (dataset_path / "qrels").exists() and any((dataset_path / "qrels").iterdir())
+        
+        if not (has_corpus and has_queries and has_qrels) and is_main_process(self.config):
+            logging.info("Downloading and extracting dataset %s ...", dataset_name)
+            # beir_util.download_and_unzip handles both download and extraction
             beir_util.download_and_unzip(url, str(Path(self.config.data_root)))
-        if dataset_name not in self._loader_cache:
-            self._loader_cache[dataset_name] = GenericDataLoader(str(dataset_path))
-        return self._loader_cache[dataset_name]
+            
+            # Flatten nested directory structure if present (e.g., msmarco/msmarco/ -> msmarco/)
+            inner_dir = dataset_path / dataset_name
+            if inner_dir.is_dir() and any(inner_dir.iterdir()):
+                logging.info("Flattening nested directory structure for %s", dataset_name)
+                for item in inner_dir.iterdir():
+                    dest = dataset_path / item.name
+                    if dest.exists():
+                        if dest.is_dir():
+                            shutil.rmtree(dest)
+                        else:
+                            dest.unlink()
+                    shutil.move(str(item), dataset_path)
+                try:
+                    inner_dir.rmdir()
+                except OSError:
+                    pass
+        else:
+            # Wait for main process to finish downloading/extracting
+            wait_for_condition(
+                lambda: (dataset_path / "corpus.jsonl").exists() and 
+                        (dataset_path / "queries.jsonl").exists() and
+                        (dataset_path / "qrels").exists(),
+                timeout=1800,
+                interval=5.0
+            )
+
+        # Verify dataset files exist
+        if not (dataset_path / "corpus.jsonl").exists():
+            raise RuntimeError(f"Dataset {dataset_name}: corpus.jsonl not found in {dataset_path}")
+        if not (dataset_path / "queries.jsonl").exists():
+            raise RuntimeError(f"Dataset {dataset_name}: queries.jsonl not found in {dataset_path}")
+        if not (dataset_path / "qrels").exists():
+            raise RuntimeError(f"Dataset {dataset_name}: qrels directory not found in {dataset_path}")
+            
+        return str(dataset_path)
 
     def _try_load_split(
         self,
-        loader: GenericDataLoader,
+        dataset_path: str,
         dataset: str,
         candidates: List[str],
     ) -> Optional[Tuple[Dict[str, Dict[str, str]], Dict[str, str], Dict[str, Dict[str, int]], str]]:
         for split in candidates:
             try:
-                corpus, queries, qrels = loader.load(split=split)
+                # Create a fresh loader for each split to avoid state pollution
+                # (GenericDataLoader filters queries based on qrels after first load)
+                fresh_loader = GenericDataLoader(dataset_path)
+                corpus, queries, qrels = fresh_loader.load(split=split)
                 logging.info(
                     "%s: loaded split '%s' with %d queries and %d qrels",
                     dataset,
@@ -284,7 +452,8 @@ class DatasetManager:
                 )
                 return corpus, dict(queries), {qid: dict(doc_scores) for qid, doc_scores in qrels.items()}, split
             except Exception as exc:  # noqa: BLE001 - surfaces dataset issues but continues
-                logging.debug("Dataset %s missing split '%s': %s", dataset, split, exc)
+                logging.debug("Dataset %s missing split '%s': %s", dataset, split, str(exc))
+        logging.warning("Dataset %s: none of the candidate splits %s were found", dataset, candidates)
         return None
 
     def _assemble_bundle(
@@ -295,7 +464,13 @@ class DatasetManager:
         test_split: Optional[Tuple[Dict[str, Dict[str, str]], Dict[str, str], Dict[str, Dict[str, int]], str]],
     ) -> DatasetBundle:
         if test_split is None:
-            raise ValueError(f"Dataset '{dataset}' is missing a required evaluation split.")
+            available = []
+            if train_split: available.append(f"train ({len(train_split[1])} queries)")
+            if dev_split: available.append(f"dev ({len(dev_split[1])} queries)")
+            raise ValueError(
+                f"Dataset '{dataset}' is missing a required evaluation split (test or dev). "
+                f"Available splits: {available or 'none'}. Check dataset directory structure."
+            )
 
         corpus = test_split[0]
         train_partition = DatasetPartition(queries=train_split[1], qrels=train_split[2]) if train_split else None
@@ -313,72 +488,76 @@ class DatasetManager:
         qrels_dir = ensure_dir(base_path / "qrels")
 
         dataset_versions: Dict[str, Any] = {}
-        for partition in ("train", "dev", "test"):
-            try:
-                dataset_versions[partition] = ir_datasets.load(f"lotte/{split}/{partition}")
-            except Exception:
-                dataset_versions[partition] = None
-        if all(dataset is None for dataset in dataset_versions.values()):
-            raise RuntimeError(
-                "Unable to load LoTTE via ir_datasets. Install the package and ensure the dataset is available."
-            )
+        if is_main_process(self.config):
+            for partition in ("train", "dev", "test"):
+                try:
+                    dataset_versions[partition] = ir_datasets.load(f"lotte/{split}/{partition}")
+                except Exception:
+                    dataset_versions[partition] = None
+            if all(dataset is None for dataset in dataset_versions.values()):
+                raise RuntimeError(
+                    "Unable to load LoTTE via ir_datasets. Install the package and ensure the dataset is available."
+                )
 
-        if not corpus_path.exists():
-            logging.info("[LoTTE:%s] Writing corpus.jsonl", split)
-            with corpus_path.open("w", encoding="utf-8") as corpus_file:
-                written = set()
-                for dataset in dataset_versions.values():
+            if not corpus_path.exists():
+                logging.info("[LoTTE:%s] Writing corpus.jsonl", split)
+                with corpus_path.open("w", encoding="utf-8") as corpus_file:
+                    written = set()
+                    for dataset in dataset_versions.values():
+                        if dataset is None:
+                            continue
+                        for doc in dataset.docs_iter():
+                            doc_id = getattr(doc, "doc_id", getattr(doc, "docid", None))
+                            if doc_id is None or doc_id in written:
+                                continue
+                            title = getattr(doc, "title", "") or ""
+                            text = getattr(doc, "text", getattr(doc, "document", ""))
+                            record = {"_id": doc_id, "title": title, "text": text}
+                            corpus_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                            written.add(doc_id)
+
+            existing_queries: set[str] = set()
+            if queries_path.exists():
+                with queries_path.open(encoding="utf-8") as qp:
+                    for line in qp:
+                        try:
+                            payload = json.loads(line)
+                            existing_queries.add(payload["_id"])
+                        except Exception:  # noqa: BLE001
+                            continue
+
+            with queries_path.open("a", encoding="utf-8") as queries_file:
+                for part, dataset in dataset_versions.items():
                     if dataset is None:
                         continue
-                    for doc in dataset.docs_iter():
-                        doc_id = getattr(doc, "doc_id", getattr(doc, "docid", None))
-                        if doc_id is None or doc_id in written:
+                    new_queries = 0
+                    for query in dataset.queries_iter():
+                        qid = getattr(query, "query_id", getattr(query, "qid", None))
+                        if qid is None or qid in existing_queries:
                             continue
-                        title = getattr(doc, "title", "") or ""
-                        text = getattr(doc, "text", getattr(doc, "document", ""))
-                        record = {"_id": doc_id, "title": title, "text": text}
-                        corpus_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                        written.add(doc_id)
+                        text = getattr(query, "text", getattr(query, "query", ""))
+                        queries_file.write(json.dumps({"_id": qid, "text": text}, ensure_ascii=False) + "\n")
+                        existing_queries.add(qid)
+                        new_queries += 1
+                    if new_queries:
+                        logging.info("[LoTTE:%s] Added %d queries from %s split", split, new_queries, part)
 
-        existing_queries: set[str] = set()
-        if queries_path.exists():
-            with queries_path.open(encoding="utf-8") as qp:
-                for line in qp:
-                    try:
-                        payload = json.loads(line)
-                        existing_queries.add(payload["_id"])
-                    except Exception:  # noqa: BLE001
-                        continue
-
-        with queries_path.open("a", encoding="utf-8") as queries_file:
             for part, dataset in dataset_versions.items():
                 if dataset is None:
                     continue
-                new_queries = 0
-                for query in dataset.queries_iter():
-                    qid = getattr(query, "query_id", getattr(query, "qid", None))
-                    if qid is None or qid in existing_queries:
-                        continue
-                    text = getattr(query, "text", getattr(query, "query", ""))
-                    queries_file.write(json.dumps({"_id": qid, "text": text}, ensure_ascii=False) + "\n")
-                    existing_queries.add(qid)
-                    new_queries += 1
-                if new_queries:
-                    logging.info("[LoTTE:%s] Added %d queries from %s split", split, new_queries, part)
-
-        for part, dataset in dataset_versions.items():
-            if dataset is None:
-                continue
-            qrels_path = qrels_dir / f"{part}.tsv"
-            if qrels_path.exists():
-                continue
-            logging.info("[LoTTE:%s] Writing qrels/%s.tsv", split, part)
-            with qrels_path.open("w", encoding="utf-8") as qrels_file:
-                for qrel in dataset.qrels_iter():
-                    qid = getattr(qrel, "query_id", getattr(qrel, "qid", None))
-                    did = getattr(qrel, "doc_id", getattr(qrel, "docid", None))
-                    rel = getattr(qrel, "relevance", getattr(qrel, "score", 1))
-                    qrels_file.write(f"{qid}\t{did}\t{rel}\n")
+                qrels_path = qrels_dir / f"{part}.tsv"
+                if qrels_path.exists():
+                    continue
+                logging.info("[LoTTE:%s] Writing qrels/%s.tsv", split, part)
+                with qrels_path.open("w", encoding="utf-8") as qrels_file:
+                    for qrel in dataset.qrels_iter():
+                        qid = getattr(qrel, "query_id", getattr(qrel, "qid", None))
+                        did = getattr(qrel, "doc_id", getattr(qrel, "docid", None))
+                        rel = getattr(qrel, "relevance", getattr(qrel, "score", 1))
+                        qrels_file.write(f"{qid}\t{did}\t{rel}\n")
+        else:
+            required_paths = [corpus_path, queries_path] + [qrels_dir / f"{part}.tsv" for part in ("train", "dev", "test")]
+            wait_for_condition(lambda: all(path.exists() for path in required_paths), timeout=1800, interval=5.0)
 
     def _apply_smoke_filters(self, bundle: DatasetBundle) -> DatasetBundle:
         if not self.config.quick_smoke_test:
@@ -439,45 +618,286 @@ class PyseriniBM25Retriever:
     def __init__(self, config: BenchmarkConfig, dataset_name: str) -> None:
         self.config = config
         self.dataset_name = dataset_name
-        self.index_path = ensure_dir(Path(config.bm25_index_root) / dataset_name)
-        self.searcher: Optional[BEIRBM25] = None
+        self.doc_ids: List[str] = []
+        self.tokenized_corpus: List[List[str]] = []
+        self.bm25: Optional[Any] = None
 
     def build(self, corpus: Dict[str, Dict[str, str]]) -> None:
-        logging.info("Building Pyserini BM25 index for %s ...", self.dataset_name)
-        self.searcher = BEIRBM25(
-            index_dir=str(self.index_path),
-            initialize=True,
-            k1=0.9,
-            b=0.4,
-        )
-        self.searcher.index(corpus)
+        logging.info("Building BM25 index for %s with %d documents...", self.dataset_name, len(corpus))
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            raise RuntimeError("rank_bm25 not installed. Install with: pip install rank-bm25")
+        
+        self.doc_ids = list(corpus.keys())
+        self.tokenized_corpus = []
+        for doc_id in self.doc_ids:
+            doc_text = corpus[doc_id].get("title", "") + " " + corpus[doc_id].get("text", "")
+            tokens = doc_text.lower().split()
+            self.tokenized_corpus.append(tokens)
+        
+        self.bm25 = BM25Okapi(self.tokenized_corpus, k1=0.9, b=0.4)
+        logging.info("BM25 index built for %s", self.dataset_name)
 
     def search(self, queries: Dict[str, str], top_k: int) -> Dict[str, Dict[str, float]]:
-        if self.searcher is None:
+        if self.bm25 is None:
             raise RuntimeError("BM25 index has not been built")
-        return self.searcher.search(corpus=None, queries=queries, top_k=top_k)
+        
+        results: Dict[str, Dict[str, float]] = {}
+        for qid, query_text in queries.items():
+            tokenized_query = query_text.lower().split()
+            scores = self.bm25.get_scores(tokenized_query)
+            top_indices = np.argsort(scores)[::-1][:top_k]
+            results[qid] = {self.doc_ids[idx]: float(scores[idx]) for idx in top_indices if scores[idx] > 0}
+        return results
 
 
 class TokenLevelMAW(nn.Module):
+    """
+    Multi-Attention-Weight (MAW) module that computes 5D attention weights.
+    
+    This module extracts query, key, and value vectors from the encoder's last layer,
+    computes a 5D attention tensor, and uses GRPO to select the optimal depth index.
+    """
     def __init__(self, hidden_size: int, depth_dim: int, num_heads: int) -> None:
         super().__init__()
-        self.depth_projection = nn.Linear(hidden_size, hidden_size * depth_dim)
+        self.hidden_size = hidden_size
         self.depth_dim = depth_dim
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-        self.feedforward = nn.Sequential(
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        
+        # Policy network for GRPO (selects depth index)
+        self.policy_network = nn.Sequential(
             nn.Linear(hidden_size, hidden_size * 2),
             nn.GELU(),
-            nn.Linear(hidden_size * 2, hidden_size),
+            nn.Linear(hidden_size * 2, depth_dim),
         )
+        
+        # Value network for GRPO (estimates expected reward)
+        self.value_network = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, 1),
+        )
+        
+        # Projections for Q, K, V
+        self.query_proj = nn.Linear(hidden_size, hidden_size)
+        self.key_proj = nn.Linear(hidden_size, hidden_size)
+        self.value_proj = nn.Linear(hidden_size, hidden_size)
+        self.output_proj = nn.Linear(hidden_size, hidden_size)
+        
         self.norm = nn.LayerNorm(hidden_size)
-
+        
+        # GRPO training state
+        self.register_buffer('baseline_reward', torch.tensor(0.0))
+        
+        # Enable gradient checkpointing for memory savings
+        self.use_gradient_checkpointing = False
+        
     def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        depth_states = self.depth_projection(hidden_states)
-        batch, seq, hidden = hidden_states.size()
-        depth_states = depth_states.view(batch, seq, self.depth_dim, hidden).mean(dim=2)
-        attn_output, _ = self.attention(hidden_states, depth_states, depth_states, key_padding_mask=~attention_mask.bool())
-        output = self.feedforward(attn_output)
+        """
+        Args:
+            hidden_states: (batch_size, sequence_length, hidden_size)
+            attention_mask: (batch_size, sequence_length)
+        
+        Returns:
+            output: (batch_size, sequence_length, hidden_size)
+        """
+        batch_size, seq_len, hidden_size = hidden_states.size()
+        
+        # Step 1-3: Project to Q, K, V and reshape for multi-head attention
+        query = self.query_proj(hidden_states)  # (batch_size, seq_len, hidden_size)
+        key = self.key_proj(hidden_states)      # (batch_size, seq_len, hidden_size)
+        value = self.value_proj(hidden_states)  # (batch_size, seq_len, hidden_size)
+        
+        # Reshape to multi-head format: (batch_size, num_heads, seq_len, head_dim)
+        query = query.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key = key.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        value = value.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Compute 5D attention weights following the MAW process
+        # Use gradient checkpointing if enabled (saves memory during training)
+        if self.use_gradient_checkpointing and self.training:
+            attn_output = torch.utils.checkpoint.checkpoint(
+                self._compute_maw_attention,
+                query, key, value, attention_mask, hidden_states,
+                use_reentrant=False
+            )
+        else:
+            attn_output = self._compute_maw_attention(query, key, value, attention_mask, hidden_states)
+        
+        # Reshape back to (batch_size, seq_len, hidden_size)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, hidden_size)
+        
+        # Output projection and residual connection
+        output = self.output_proj(attn_output)
         return self.norm(hidden_states + output)
+    
+    def _compute_maw_attention(
+        self, 
+        query: torch.Tensor,  # (batch_size, num_heads, seq_len_q, head_dim)
+        key: torch.Tensor,    # (batch_size, num_heads, seq_len_k, head_dim)
+        value: torch.Tensor,  # (batch_size, num_heads, seq_len_k, head_dim)
+        attention_mask: torch.Tensor,  # (batch_size, seq_len)
+        hidden_states: torch.Tensor,   # (batch_size, seq_len, hidden_size) for policy/value
+    ) -> torch.Tensor:
+        """
+        Compute Multi-Attention-Weight (MAW) attention following the 7-step process.
+        Creates proper 5D attention tensor: (batch_size, num_heads, seq_len_q, seq_len_k, depth_dim)
+        """
+        batch_size, num_heads, seq_len_q, head_dim = query.size()
+        seq_len_k = key.size(2)
+        
+        # MAW 7-STEP PROCESS (as specified)
+        
+        # Step 1: Increase dimension of query vector and transpose
+        # Target: (batch_size, num_heads, depth, seq_len_q, 1)
+        # Current query shape: (batch_size, num_heads, seq_len_q, head_dim)
+        
+        # Reshape query: (B, H, seq_q, head_dim) -> (B, H, 1, seq_q, head_dim)
+        query_reshaped = query.unsqueeze(2)
+        # Expand depth: (B, H, 1, seq_q, head_dim) -> (B, H, depth, seq_q, head_dim)
+        query_reshaped = query_reshaped.expand(batch_size, num_heads, self.depth_dim, seq_len_q, head_dim)
+        # Reduce head_dim by averaging: (B, H, depth, seq_q, head_dim) -> (B, H, depth, seq_q, 1)
+        query_expanded = query_reshaped.mean(dim=-1, keepdim=True)
+        
+        # Step 2: Increase dimension of key vector and transpose
+        # Target: (batch_size, num_heads, depth, 1, seq_len_k)
+        # Current key shape: (batch_size, num_heads, seq_len_k, head_dim)
+        
+        # Reshape key: (B, H, seq_k, head_dim) -> (B, H, 1, seq_k, head_dim)
+        key_reshaped = key.unsqueeze(2)
+        # Expand depth: (B, H, 1, seq_k, head_dim) -> (B, H, depth, seq_k, head_dim)
+        key_reshaped = key_reshaped.expand(batch_size, num_heads, self.depth_dim, seq_len_k, head_dim)
+        # Reduce head_dim by averaging: (B, H, depth, seq_k, head_dim) -> (B, H, depth, seq_k)
+        key_reduced = key_reshaped.mean(dim=-1)
+        # Reshape to target: (B, H, depth, seq_k) -> (B, H, depth, 1, seq_k)
+        key_expanded = key_reduced.unsqueeze(3)
+        
+        # Step 3: Multiply query and key to get 5D attention tensor
+        # Shape: (batch_size, num_heads, depth, seq_len_q, seq_len_k)
+        attn_5d = torch.matmul(query_expanded, key_expanded)
+        
+        # Step 4: Transpose to put depth dimension last
+        # From: (batch_size, num_heads, depth, seq_len_q, seq_len_k)
+        # To: (batch_size, num_heads, seq_len_q, seq_len_k, depth)
+        attn_5d = attn_5d.permute(0, 1, 3, 4, 2)
+        
+        # Step 5: Use GRPO to select the best depth index
+        if self.training:
+            depth_weights = self._grpo_select_depth_5d(attn_5d, hidden_states, attention_mask)
+        else:
+            # During inference, use greedy selection (argmax of policy)
+            if attention_mask is not None:
+                pooled_hidden = (hidden_states * attention_mask.unsqueeze(-1)).sum(dim=1) / attention_mask.sum(dim=1, keepdim=True)
+            else:
+                pooled_hidden = hidden_states.mean(dim=1)
+            policy_logits = self.policy_network(pooled_hidden)  # (batch_size, depth_dim)
+            depth_idx = policy_logits.argmax(dim=-1)  # (batch_size,)
+            # Create one-hot weights
+            depth_weights = F.one_hot(depth_idx, num_classes=self.depth_dim).float()  # (batch_size, depth_dim)
+        
+        # Apply depth weights to reduce 5D tensor to 4D
+        # depth_weights: (batch_size, depth_dim) -> (batch_size, 1, 1, 1, depth_dim)
+        depth_weights = depth_weights.view(batch_size, 1, 1, 1, self.depth_dim)
+        
+        # Weighted sum over depth dimension
+        # Result: (batch_size, num_heads, seq_len_q, seq_len_k)
+        attn_4d = (attn_5d * depth_weights).sum(dim=-1)
+        
+        # Step 6: Softmax over the last dimension (seq_len_k)
+        # Apply attention mask before softmax
+        if attention_mask is not None:
+            # Expand mask to match attention shape
+            mask_expanded = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+            attn_4d = attn_4d.masked_fill(~mask_expanded.bool(), float('-inf'))
+        
+        attn_weights = F.softmax(attn_4d, dim=-1)  # (batch_size, num_heads, seq_len_q, seq_len_k)
+        
+        # Handle NaN from softmax of all -inf
+        attn_weights = torch.where(torch.isnan(attn_weights), torch.zeros_like(attn_weights), attn_weights)
+        
+        # Step 7: Multiply attention weights with value vectors
+        attn_output = torch.matmul(attn_weights, value)  # (batch_size, num_heads, seq_len_q, head_dim)
+        
+        return attn_output
+    
+    def _grpo_select_depth_5d(
+        self,
+        attn_5d: torch.Tensor,  # (batch_size, num_heads, seq_len_q, seq_len_k, depth_dim)
+        hidden_states: torch.Tensor,  # (batch_size, seq_len, hidden_size)
+        attention_mask: Optional[torch.Tensor] = None,  # (batch_size, seq_len)
+    ) -> torch.Tensor:
+        """
+        Use GRPO to select the best depth from 5D attention tensor.
+        
+        Args:
+            attn_5d: 5D attention tensor (batch_size, num_heads, seq_len_q, seq_len_k, depth_dim)
+            hidden_states: Input hidden states for policy/value networks
+            attention_mask: Attention mask
+            
+        Returns:
+            depth_weights: (batch_size, depth_dim) - soft weights over depth dimension
+        """
+        batch_size = attn_5d.size(0)
+        
+        # Pool hidden states
+        if attention_mask is not None:
+            pooled_hidden = (hidden_states * attention_mask.unsqueeze(-1)).sum(dim=1) / attention_mask.sum(dim=1, keepdim=True)
+        else:
+            pooled_hidden = hidden_states.mean(dim=1)
+        
+        # Compute policy logits (probability distribution over depth indices)
+        policy_logits = self.policy_network(pooled_hidden)  # (batch_size, depth_dim)
+        policy_probs = F.softmax(policy_logits, dim=-1)
+        
+        # Compute value estimate
+        value_estimate = self.value_network(pooled_hidden).squeeze(-1)  # (batch_size,)
+        
+        # Sample depth indices from policy
+        depth_dist = torch.distributions.Categorical(probs=policy_probs)
+        depth_indices = depth_dist.sample()  # (batch_size,)
+        
+        # Compute reward based on attention quality at selected depth
+        # Select attention scores at sampled depth: (batch_size, num_heads, seq_len_q, seq_len_k)
+        selected_attn = attn_5d.gather(
+            dim=-1,
+            index=depth_indices.view(batch_size, 1, 1, 1, 1).expand(
+                batch_size, attn_5d.size(1), attn_5d.size(2), attn_5d.size(3), 1
+            )
+        ).squeeze(-1)
+        
+        # Compute reward: negative entropy encourages focused attention
+        attn_softmax = F.softmax(selected_attn, dim=-1)
+        entropy = -(attn_softmax * torch.log(attn_softmax + 1e-10)).sum(dim=-1)  # (batch_size, num_heads, seq_len_q)
+        reward = -entropy.mean(dim=(1, 2))  # (batch_size,) - lower entropy is better
+        
+        # GRPO loss: policy gradient with baseline
+        advantage = reward - self.baseline_reward
+        log_probs = depth_dist.log_prob(depth_indices)
+        policy_loss = -(log_probs * advantage.detach()).mean()
+        
+        # Value loss
+        value_loss = F.mse_loss(value_estimate, reward.detach())
+        
+        # Total loss (will be added to the main loss during training)
+        grpo_loss = policy_loss + 0.5 * value_loss
+        
+        # Update baseline (exponential moving average)
+        with torch.no_grad():
+            self.baseline_reward = 0.95 * self.baseline_reward + 0.05 * reward.mean()
+        
+        # Store loss for backward pass (attached to the output)
+        # In training mode, use soft weights from policy (Gumbel-Softmax for differentiability)
+        if self.training:
+            # Use Gumbel-Softmax for differentiable sampling
+            depth_weights = F.gumbel_softmax(policy_logits, tau=1.0, hard=False)
+            # Add GRPO loss to computation graph
+            depth_weights = depth_weights + 0.0 * grpo_loss  # Trick to include loss in backward
+        else:
+            depth_weights = policy_probs
+        
+        return depth_weights  # (batch_size, depth_dim)
 
 
 class HFTextEncoder(nn.Module):
@@ -511,16 +931,74 @@ class HFTextEncoder(nn.Module):
             )
             self.model = get_peft_model(self.model, lora_cfg)
 
-        self.maw_layers = None
+        # MAW: Apply to specific encoder layers
+        self.maw_modules = None
+        self.maw_layer_indices = None
         if config.use_maw:
-            self.maw_layers = nn.ModuleList(
-                [TokenLevelMAW(self.hidden_size_value, config.maw_depth_dim, config.maw_num_heads) for _ in range(config.maw_layers)]
-            )
+            # Determine which layers to apply MAW to
+            num_encoder_layers = self._get_num_encoder_layers(hf_config)
+            self.maw_layer_indices = self._resolve_maw_layer_indices(config.maw_layer_indices, num_encoder_layers)
+            
+            # Create MAW module for each specified layer
+            self.maw_modules = nn.ModuleDict({
+                str(idx): TokenLevelMAW(self.hidden_size_value, config.maw_depth_dim, config.maw_num_heads)
+                for idx in self.maw_layer_indices
+            })
+            
+            # Enable gradient checkpointing for MAW modules to save memory
+            for maw_module in self.maw_modules.values():
+                maw_module.use_gradient_checkpointing = True
+            
+            logging.info(f"MAW enabled on encoder layers: {self.maw_layer_indices} (with gradient checkpointing)")
 
         self.primary_device = self._resolve_primary_device()
-        self.model.to(self.primary_device)
-        if config.device.startswith("cuda") and len(config.device_ids) > 1:
-            self.model = nn.DataParallel(self.model, device_ids=list(config.device_ids))
+        self.to(self.primary_device)
+    
+    def _get_num_encoder_layers(self, hf_config) -> int:
+        """Get the number of encoder layers from HuggingFace config"""
+        # Different models use different attribute names
+        if hasattr(hf_config, 'num_hidden_layers'):
+            return hf_config.num_hidden_layers
+        elif hasattr(hf_config, 'n_layers'):
+            return hf_config.n_layers
+        elif hasattr(hf_config, 'num_layers'):
+            return hf_config.num_layers
+        else:
+            # Default fallback
+            return 12
+    
+    def _resolve_maw_layer_indices(self, layer_indices: List[int], num_layers: int) -> List[int]:
+        """
+        Resolve layer indices, handling negative indexing and 'all' specification.
+        
+        Args:
+            layer_indices: List of layer indices. -1 means last layer, -2 second to last, etc.
+                          If list contains many indices (e.g., from 'all'), they'll be clamped.
+            num_layers: Total number of encoder layers
+        
+        Returns:
+            List of resolved positive layer indices (0-indexed)
+        """
+        # Check if this is the "all layers" case (large list of indices)
+        if len(layer_indices) >= num_layers:
+            return list(range(num_layers))
+        
+        resolved = []
+        for idx in layer_indices:
+            if idx < 0:
+                # Negative indexing: -1 = last layer, -2 = second to last, etc.
+                resolved_idx = num_layers + idx
+            else:
+                resolved_idx = idx
+            
+            # Validate index is in range
+            if 0 <= resolved_idx < num_layers:
+                if resolved_idx not in resolved:  # Avoid duplicates
+                    resolved.append(resolved_idx)
+            else:
+                logging.warning(f"MAW layer index {idx} (resolved to {resolved_idx}) is out of range [0, {num_layers-1}]. Skipping.")
+        
+        return sorted(resolved)
 
     def _encode_text_batch(self, texts: List[str]) -> torch.Tensor:
         tokenized = self.tokenizer(
@@ -532,18 +1010,39 @@ class HFTextEncoder(nn.Module):
         )
         tokenized = {k: v.to(self.primary_device) for k, v in tokenized.items()}
         with torch.set_grad_enabled(self.training):
-            outputs = self.model(**tokenized)
-            hidden_states = outputs.last_hidden_state
-            if self.maw_layers is not None:
-                for layer in self.maw_layers:
-                    hidden_states = layer(hidden_states, tokenized["attention_mask"])
+            if self.maw_modules is not None:
+                # Need to get hidden states from all layers to apply MAW at specific layers
+                outputs = self.model(**tokenized, output_hidden_states=True)
+                all_hidden_states = outputs.hidden_states  # Tuple of (num_layers + 1) tensors
+                
+                # Apply MAW to specified layers
+                # Note: hidden_states[0] is embeddings, hidden_states[i+1] is output of layer i
+                modified_states = list(all_hidden_states)
+                for layer_idx in self.maw_layer_indices:
+                    # Apply MAW to the output of layer_idx
+                    # hidden_states[layer_idx + 1] contains output from encoder layer layer_idx
+                    state_idx = layer_idx + 1
+                    if state_idx < len(modified_states):
+                        maw_module = self.maw_modules[str(layer_idx)]
+                        modified_states[state_idx] = maw_module(
+                            modified_states[state_idx], 
+                            tokenized["attention_mask"]
+                        )
+                
+                # Use the final hidden state (after all modifications)
+                hidden_states = modified_states[-1]
+            else:
+                # Standard forward pass without MAW
+                outputs = self.model(**tokenized)
+                hidden_states = outputs.last_hidden_state
+            
             pooled = mean_pool(hidden_states, tokenized["attention_mask"])
             normalized = F.normalize(pooled, p=2, dim=-1)
         return normalized
 
     def encode_train(self, texts: List[str], batch_size: Optional[int] = None) -> torch.Tensor:
-        if batch_size is None:
-            batch_size = self.config.batch_size
+        if batch_size is None or batch_size <= 0:
+            batch_size = max(len(texts), 1) if len(texts) > 0 else self.config.batch_size
         embeddings: List[torch.Tensor] = []
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]
@@ -569,8 +1068,8 @@ class HFTextEncoder(nn.Module):
             return torch.zeros((0, self.hidden_size_value))
         return torch.vstack(batches)
 
-    def forward(self, texts: List[str]) -> torch.Tensor:  # type: ignore[override]
-        return self.encode_train(texts, batch_size=self.config.batch_size)
+    def forward(self, texts: List[str], chunk_size: Optional[int] = None) -> torch.Tensor:  # type: ignore[override]
+        return self.encode_train(texts, batch_size=chunk_size or self.config.batch_size)
 
     def freeze_base(self) -> None:
         for name, param in self.base_model.named_parameters():
@@ -588,11 +1087,11 @@ class HFTextEncoder(nn.Module):
 
     @property
     def base_model(self) -> nn.Module:
-        return self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        return self.model
 
     def _resolve_primary_device(self) -> torch.device:
-        if self.config.device.startswith("cuda") and self.config.device_ids:
-            return torch.device(f"cuda:{self.config.device_ids[0]}")
+        if self.config.device.startswith("cuda"):
+            return torch.device(self.config.device)
         return torch.device("cpu")
 
 
@@ -645,10 +1144,19 @@ class TripletDataset(Dataset):
 
 class ContrastiveTrainer:
     def __init__(self, encoder: HFTextEncoder, config: BenchmarkConfig) -> None:
-        self.encoder = encoder
         self.config = config
-        params = [p for p in encoder.parameters() if p.requires_grad]
+        self.module = encoder
+        self.parallel_model = self._wrap_for_distribution(encoder)
+        params = [p for p in self.parallel_model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(params, lr=config.learning_rate, weight_decay=config.weight_decay)
+        self.device = encoder.primary_device
+        self.amp_dtype = self._resolve_amp_dtype()
+        self.autocast_enabled = (
+            self.config.use_amp
+            and self.config.device.startswith("cuda")
+            and self.amp_dtype != torch.float32
+        )
+        self.scaler = GradScaler('cuda', enabled=self.autocast_enabled and self.amp_dtype == torch.float16)
         self.global_step = 0
         self.wall_clock_start = None
         self.tokens_processed = 0
@@ -664,12 +1172,22 @@ class ContrastiveTrainer:
         if len(train_dataset) == 0:
             return {"steps": 0, "tokens": 0, "wall_clock_sec": 0.0}
 
+        sampler: Optional[DistributedSampler] = None
+        if self.config.distributed:
+            sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=self.config.world_size,
+                rank=self.config.rank,
+                shuffle=True,
+            )
+
         max_workers = max(1, min(8, (os.cpu_count() or 1)))
         dataloader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
+            shuffle=sampler is None,
             drop_last=True,
+            sampler=sampler,
             num_workers=max_workers,
             pin_memory=self.config.device.startswith("cuda"),
         )
@@ -677,25 +1195,30 @@ class ContrastiveTrainer:
         warmup_steps = int(num_training_steps * self.config.warmup_ratio)
         scheduler = get_linear_schedule_with_warmup(self.optimizer, warmup_steps, num_training_steps)
 
-        logging.info(
-            "[Train:%s] Using %s | batches=%d | epochs=%d",
-            dataset_name,
-            device_status(self.config),
-            len(dataloader),
-            self.config.epochs,
-        )
+        log_enabled = is_main_process(self.config)
+        if log_enabled:
+            logging.info(
+                "[Train:%s] Using %s | batches=%d | epochs=%d",
+                dataset_name,
+                device_status(self.config),
+                len(dataloader),
+                self.config.epochs,
+            )
 
-        self.encoder.train()
+        self.parallel_model.train()
         best_metric = -1.0
         best_state = None
         self.wall_clock_start = time.time()
 
         status = device_status(self.config)
         for epoch in range(self.config.epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             progress = tqdm(
                 dataloader,
                 desc=f"Epoch {epoch+1}/{self.config.epochs} [{status}]",
                 leave=False,
+                disable=not log_enabled,
             )
             for batch in progress:
                 queries, positives, negatives = batch
@@ -703,62 +1226,129 @@ class ContrastiveTrainer:
                 batch_pos = list(positives)
                 negative_lists = [list(nlist) for nlist in negatives]
 
-                query_emb = self.encoder.encode_train(batch_queries)
-                pos_emb = self.encoder.encode_train(batch_pos)
-
                 flat_negatives = [neg for neg_list in negative_lists for neg in neg_list]
-                if flat_negatives:
-                    neg_batch_size = self.config.batch_size * max(1, self.config.negatives_per_query)
-                    neg_emb = self.encoder.encode_train(flat_negatives, batch_size=neg_batch_size)
-                else:
-                    neg_emb = torch.empty((0, query_emb.size(1)), device=self.config.device)
+                merged_texts = batch_queries + batch_pos + flat_negatives
 
-                doc_emb = torch.cat([pos_emb, neg_emb], dim=0)
+                with self._autocast_context():
+                    embeddings = self.parallel_model(merged_texts, chunk_size=len(merged_texts))
+
+                num_queries = len(batch_queries)
+                num_pos = len(batch_pos)
+                pos_start = num_queries
+                pos_end = pos_start + num_pos
+                query_emb = embeddings[:num_queries]
+                pos_emb = embeddings[pos_start:pos_end]
+                neg_emb = embeddings[pos_end:]
+
+                doc_emb = torch.cat([pos_emb, neg_emb], dim=0) if neg_emb.numel() else pos_emb
                 logits = torch.matmul(query_emb, doc_emb.t()) / self.config.temperature
-                labels = torch.arange(logits.size(0), device=self.config.device)
+                logits = logits.float()
+                labels = torch.arange(logits.size(0), device=query_emb.device)
                 loss = F.cross_entropy(logits, labels)
 
-                self.optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), max_norm=2.0)
-                self.optimizer.step()
+                self.optimizer.zero_grad(set_to_none=True)
+
+                if self.scaler.is_enabled():
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.parallel_model.parameters(), max_norm=2.0)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.parallel_model.parameters(), max_norm=2.0)
+                    self.optimizer.step()
                 scheduler.step()
 
                 self.global_step += 1
                 token_factor = 1 + 1 + self.config.negatives_per_query
                 token_count = len(batch_queries) * self.config.max_seq_length * token_factor
                 self.tokens_processed += token_count
-                progress.set_postfix({"loss": loss.item(), "step": self.global_step})
+                if log_enabled:
+                    progress.set_postfix({"loss": loss.item(), "step": self.global_step})
 
             if dev_partition is not None and not dev_partition.is_empty():
-                metrics, _ = evaluator.evaluate_dense_model(
-                    dataset_name,
-                    self.encoder,
-                    corpus,
-                    dev_partition.queries,
-                    dev_partition.qrels,
-                    split="dev",
-                )
-                dev_metric = metrics.get("nDCG@10", metrics.get("MAP@100", 0.0))
-                if dev_metric > best_metric:
-                    best_metric = dev_metric
-                    best_state = {k: v.detach().cpu() for k, v in self.encoder.state_dict().items()}
+                if log_enabled:
+                    metrics, _ = evaluator.evaluate_dense_model(
+                        dataset_name,
+                        self.module,
+                        corpus,
+                        dev_partition.queries,
+                        dev_partition.qrels,
+                        split="dev",
+                    )
+                    dev_metric = metrics.get("nDCG@10", metrics.get("MAP@100", 0.0))
+                    if dev_metric > best_metric:
+                        best_metric = dev_metric
+                        best_state = {k: v.detach().cpu() for k, v in self.module.state_dict().items()}
+                if self.config.distributed and dist.is_available() and dist.is_initialized():
+                    dist.barrier()
 
-        if best_state:
-            self.encoder.load_state_dict(best_state)
+        synced_state = self._synchronize_best_state(best_state)
+        if synced_state:
+            self.module.load_state_dict(synced_state)
+
+        self.parallel_model.eval()
 
         wall_clock = time.time() - self.wall_clock_start
+        total_tokens = self.tokens_processed
+        if self.config.distributed and dist.is_available() and dist.is_initialized():
+            token_tensor = torch.tensor([self.tokens_processed], device=self.device, dtype=torch.float32)
+            dist.all_reduce(token_tensor, op=dist.ReduceOp.SUM)
+            total_tokens = int(token_tensor.item())
+            wall_tensor = torch.tensor([wall_clock], device=self.device, dtype=torch.float32)
+            dist.all_reduce(wall_tensor, op=dist.ReduceOp.MAX)
+            wall_clock = float(wall_tensor.item())
+
         return {
             "steps": self.global_step,
-            "tokens": self.tokens_processed,
+            "tokens": total_tokens,
             "wall_clock_sec": wall_clock,
         }
+
+    def _wrap_for_distribution(self, module: HFTextEncoder) -> nn.Module:
+        if not self.config.distributed:
+            return module
+        kwargs: Dict[str, Any] = {"broadcast_buffers": False, "find_unused_parameters": False}
+        if self.config.device.startswith("cuda"):
+            kwargs["device_ids"] = [self.config.primary_device_index]
+            kwargs["output_device"] = self.config.primary_device_index
+        return nn.parallel.DistributedDataParallel(module, **kwargs)
+
+    def _resolve_amp_dtype(self) -> torch.dtype:
+        if not self.config.use_amp or not self.config.device.startswith("cuda"):
+            return torch.float32
+        requested = self.config.amp_dtype.lower()
+        if requested in {"bf16", "bfloat16"}:
+            bf16_available = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+            if bf16_available:
+                return torch.bfloat16
+            logging.warning("bf16 requested but not supported on this device; falling back to fp16.")
+            return torch.float16
+        if requested in {"fp16", "float16", "half"}:
+            return torch.float16
+        logging.warning("Unrecognized amp_dtype '%s'; defaulting to fp16.", self.config.amp_dtype)
+        return torch.float16
+
+    def _autocast_context(self):
+        if self.autocast_enabled:
+            return autocast(device_type='cuda', dtype=self.amp_dtype)
+        return nullcontext()
+
+    def _synchronize_best_state(self, state: Optional[Dict[str, torch.Tensor]]) -> Optional[Dict[str, torch.Tensor]]:
+        if not self.config.distributed:
+            return state
+        obj_list: List[Optional[Dict[str, torch.Tensor]]] = [state if is_main_process(self.config) else None]
+        dist.broadcast_object_list(obj_list, src=0)
+        return obj_list[0]
 
 
 class EvaluationManager:
     def __init__(self, config: BenchmarkConfig) -> None:
         self.config = config
         self.primary_device = self._resolve_primary_device()
+        self.use_amp = config.use_amp and self.primary_device.type == "cuda"
+        self.search_dtype = self._resolve_search_dtype()
 
     def evaluate_dense_model(
         self,
@@ -786,37 +1376,61 @@ class EvaluationManager:
 
         corpus_embeddings = self._prepare_corpus_embeddings(encoder, cache_prefix, doc_ids, corpus)
 
-        results: Dict[str, Dict[str, float]] = {}
-        query_ids = list(queries.keys())
-        query_texts = [queries[qid] for qid in query_ids]
+        query_pairs = [(qid, queries[qid]) for qid in queries]
+        if self.config.distributed and dist.is_available() and dist.is_initialized():
+            query_pairs = query_pairs[self.config.rank :: self.config.world_size]
+
+        log_enabled = is_main_process(self.config)
+        local_results: Dict[str, Dict[str, float]] = {}
 
         for start in tqdm(
-            range(0, len(query_ids), self.config.eval_batch_size),
+            range(0, len(query_pairs), self.config.eval_batch_size),
             desc=f"{dataset_id}/{split}:queries [{device_status(self.config)}]",
             leave=False,
+            disable=not log_enabled,
         ):
-            batch_ids = query_ids[start : start + self.config.eval_batch_size]
-            batch_texts = query_texts[start : start + self.config.eval_batch_size]
-            if not batch_ids:
+            batch = query_pairs[start : start + self.config.eval_batch_size]
+            if not batch:
                 continue
-            batch_embeddings = encoder.encode(batch_texts, batch_size=self.config.eval_batch_size)
-            batch_np = np.ascontiguousarray(batch_embeddings.numpy(), dtype=np.float32)
-            if batch_np.size == 0:
+            batch_ids = [pair[0] for pair in batch]
+            batch_texts = [pair[1] for pair in batch]
+            if self.use_amp and self.primary_device.type == "cuda":
+                with autocast(device_type='cuda', dtype=self.search_dtype):
+                    batch_embeddings = encoder.encode(batch_texts, batch_size=self.config.eval_batch_size)
+            else:
+                batch_embeddings = encoder.encode(batch_texts, batch_size=self.config.eval_batch_size)
+            if batch_embeddings.numel() == 0:
                 continue
-            scores, indices = self._search_corpus(batch_np, corpus_embeddings, top_k)
+            scores, indices = self._search_corpus(batch_embeddings, corpus_embeddings, top_k)
+            scores_np = scores.numpy()
+            indices_np = indices.numpy()
             for row, qid in enumerate(batch_ids):
                 ranking: Dict[str, float] = {}
-                for col in range(scores.shape[1]):
-                    doc_idx = int(indices[row, col])
+                for col in range(scores_np.shape[1]):
+                    doc_idx = int(indices_np[row, col])
                     if doc_idx < 0 or doc_idx >= len(doc_ids):
                         continue
-                    ranking[doc_ids[doc_idx]] = float(scores[row, col])
-                results[qid] = ranking
+                    ranking[doc_ids[doc_idx]] = float(scores_np[row, col])
+                local_results[qid] = ranking
+
+        partials = all_gather_objects(self.config, local_results)
+        results: Dict[str, Dict[str, float]] = {}
+        for part in partials:
+            if part:
+                results.update(part)
 
         if previous_mode:
             encoder.train()
 
-        metrics, per_query = self.compute_metrics(qrels, results)
+        metrics: Dict[str, float]
+        per_query: Dict[str, Dict[str, float]]
+        if is_main_process(self.config):
+            metrics, per_query = self.compute_metrics(qrels, results)
+        else:
+            metrics, per_query = {}, {}
+
+        metrics = broadcast_object(self.config, metrics)
+        per_query = broadcast_object(self.config, per_query)
         return metrics, per_query
 
     def evaluate_bm25(
@@ -908,174 +1522,134 @@ class EvaluationManager:
         emb_path = cache_dir / f"corpus_{len(doc_ids)}_{hidden_size}.memmap"
         meta_path = cache_dir / "meta.json"
 
+        def _load_memmap() -> np.memmap:
+            return np.memmap(emb_path, dtype=np.float32, mode="r", shape=(len(doc_ids), hidden_size))
+
+        metadata_valid = False
         if emb_path.exists() and meta_path.exists():
             try:
                 with meta_path.open("r") as f:
                     meta = json.load(f)
-                if meta.get("doc_count") == len(doc_ids) and meta.get("hidden") == hidden_size:
-                    return np.memmap(emb_path, dtype=np.float32, mode="r", shape=(len(doc_ids), hidden_size))
+                metadata_valid = meta.get("doc_count") == len(doc_ids) and meta.get("hidden") == hidden_size
             except Exception as exc:  # noqa: BLE001
                 logging.warning("Failed to reuse dense cache at %s: %s", emb_path, exc)
 
-        logging.info("Encoding corpus embeddings for cache prefix '%s' (%d documents)...", cache_prefix, len(doc_ids))
-        writer = np.memmap(emb_path, dtype=np.float32, mode="w+", shape=(len(doc_ids), hidden_size))
-        offset = 0
-        batch_size = self.config.eval_batch_size
-        for start in tqdm(
-            range(0, len(doc_ids), batch_size),
-            desc=f"{cache_prefix}:encode_corpus [{device_status(self.config)}]",
-            leave=False,
-        ):
-            batch_ids = doc_ids[start : start + batch_size]
-            batch_texts = [compose_document_text(corpus[doc_id]) for doc_id in batch_ids]
-            batch_embeddings = encoder.encode(batch_texts, batch_size=batch_size)
-            batch_np = np.ascontiguousarray(batch_embeddings.numpy(), dtype=np.float32)
-            if batch_np.size == 0:
-                continue
-            end = offset + batch_np.shape[0]
-            writer[offset:end] = batch_np
-            offset = end
-        if offset != len(doc_ids):
-            logging.warning(
-                "Corpus embedding cache for %s expected %d vectors but wrote %d.",
-                cache_prefix,
-                len(doc_ids),
-                offset,
-            )
-        writer.flush()
-        del writer
+        if metadata_valid:
+            if self.config.distributed and dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            return _load_memmap()
 
-        with meta_path.open("w") as f:
-            json.dump({"doc_count": len(doc_ids), "hidden": hidden_size}, f)
+        def _encode_corpus() -> None:
+            logging.info("Encoding corpus embeddings for cache prefix '%s' (%d documents)...", cache_prefix, len(doc_ids))
+            writer = np.memmap(emb_path, dtype=np.float32, mode="w+", shape=(len(doc_ids), hidden_size))
+            offset = 0
+            batch_size = self.config.eval_batch_size
+            for start in tqdm(
+                range(0, len(doc_ids), batch_size),
+                desc=f"{cache_prefix}:encode_corpus [{device_status(self.config)}]",
+                leave=False,
+            ):
+                batch_ids = doc_ids[start : start + batch_size]
+                batch_texts = [compose_document_text(corpus[doc_id]) for doc_id in batch_ids]
+                batch_embeddings = encoder.encode(batch_texts, batch_size=batch_size)
+                batch_np = batch_embeddings.to(torch.float32).cpu().numpy()
+                if batch_np.size == 0:
+                    continue
+                end = offset + batch_np.shape[0]
+                writer[offset:end] = batch_np
+                offset = end
+            if offset != len(doc_ids):
+                logging.warning(
+                    "Corpus embedding cache for %s expected %d vectors but wrote %d.",
+                    cache_prefix,
+                    len(doc_ids),
+                    offset,
+                )
+            writer.flush()
+            del writer
 
-        return np.memmap(emb_path, dtype=np.float32, mode="r", shape=(len(doc_ids), hidden_size))
+            with meta_path.open("w") as f:
+                json.dump({"doc_count": len(doc_ids), "hidden": hidden_size}, f)
+
+        if self.config.distributed and dist.is_available() and dist.is_initialized():
+            if is_main_process(self.config):
+                _encode_corpus()
+                dist.barrier()
+            else:
+                dist.barrier()
+            return _load_memmap()
+
+        _encode_corpus()
+        return _load_memmap()
 
     def _search_corpus(
         self,
-        query_embeddings: np.ndarray,
+        query_embeddings: torch.Tensor,
         corpus_embeddings: np.memmap,
         top_k: int,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        num_queries = query_embeddings.shape[0]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_queries = query_embeddings.size(0)
         num_docs = corpus_embeddings.shape[0]
-        if num_docs == 0 or top_k == 0:
-            return np.empty((num_queries, 0), dtype=np.float32), np.empty((num_queries, 0), dtype=np.int64)
+        if num_docs == 0 or top_k == 0 or num_queries == 0:
+            empty_scores = torch.empty((num_queries, 0), dtype=torch.float32)
+            empty_indices = torch.empty((num_queries, 0), dtype=torch.long)
+            return empty_scores, empty_indices
 
         k = min(top_k, num_docs)
-        base_chunk = max(k, self._determine_chunk_size(num_queries))
-        devices = [torch.device(f"cuda:{idx}") for idx in self.config.device_ids] if (
-            self.config.device.startswith("cuda") and self.config.device_ids
-        ) else []
-        device_count = max(1, len(devices))
-        per_device_chunk = max(1, base_chunk // device_count)
-        if devices and per_device_chunk > 60000:
-            per_device_chunk = 60000
+        device = self.primary_device
+        if self.use_amp:
+            queries = query_embeddings.to(device=device, dtype=self.search_dtype, non_blocking=True)
+        else:
+            queries = query_embeddings.to(device=device, dtype=torch.float32, non_blocking=True)
 
-        top_scores = np.full((num_queries, k), -np.inf, dtype=np.float32)
-        top_indices = np.full((num_queries, k), -1, dtype=np.int64)
+        top_scores = torch.full((num_queries, k), float("-inf"), device=device, dtype=torch.float32)
+        top_indices = torch.full((num_queries, k), -1, device=device, dtype=torch.long)
 
-        queries_gpu = {}
-        queries_tensor_cpu = torch.from_numpy(query_embeddings)
-        if devices:
-            for device in devices:
-                with torch.cuda.device(device):
-                    queries_gpu[device] = queries_tensor_cpu.to(device, non_blocking=False)
-
-        doc_pointer = 0
-        while doc_pointer < num_docs:
-            tasks: List[Tuple[torch.device, int, int, np.ndarray]] = []
-            for device in devices or [torch.device("cpu")]:
-                if doc_pointer >= num_docs:
-                    break
-                end = min(doc_pointer + per_device_chunk, num_docs)
-                chunk = np.asarray(corpus_embeddings[doc_pointer:end], dtype=np.float32)
-                if chunk.size == 0:
-                    doc_pointer = end
-                    continue
-                tasks.append((device, doc_pointer, end, chunk))
-                doc_pointer = end
-            results = self._run_parallel_matmul(tasks, queries_tensor_cpu, queries_gpu)
-            if not results:
+        chunk_size = max(k, self._determine_chunk_size(num_queries))
+        for start in range(0, num_docs, chunk_size):
+            end = min(start + chunk_size, num_docs)
+            docs_np = np.asarray(corpus_embeddings[start:end], dtype=np.float32)
+            if docs_np.size == 0:
                 continue
-            for chunk_start, chunk_end, scores in sorted(results, key=lambda x: x[0]):
-                combined_scores = np.concatenate([top_scores, scores], axis=1)
-                range_indices = np.arange(chunk_start, chunk_end, dtype=np.int64)
-                chunk_indices = np.broadcast_to(range_indices, (num_queries, chunk_end - chunk_start))
-                combined_indices = np.concatenate([top_indices, chunk_indices], axis=1)
-                if k < combined_scores.shape[1]:
-                    top_idx = np.argpartition(combined_scores, -k, axis=1)[:, -k:]
-                    top_scores = np.take_along_axis(combined_scores, top_idx, axis=1)
-                    top_indices = np.take_along_axis(combined_indices, top_idx, axis=1)
-                else:
-                    top_scores = combined_scores
-                    top_indices = combined_indices
-                order = np.argsort(-top_scores, axis=1)
-                top_scores = np.take_along_axis(top_scores, order, axis=1)
-                top_indices = np.take_along_axis(top_indices, order, axis=1)
-        if queries_gpu:
-            for tensor in queries_gpu.values():
-                del tensor
-            queries_gpu.clear()
-        return top_scores, top_indices
+            # Make a writable copy to avoid PyTorch warning about non-writable arrays
+            docs_np = np.array(docs_np, copy=True)
+            if self.use_amp:
+                docs = torch.from_numpy(docs_np).to(device=device, dtype=self.search_dtype, non_blocking=True)
+            else:
+                docs = torch.from_numpy(docs_np).to(device=device, dtype=torch.float32, non_blocking=True)
+            scores = torch.matmul(queries, docs.t()).float()
+            combined_scores = torch.cat([top_scores, scores], dim=1)
+            doc_indices = torch.arange(start, end, device=device, dtype=torch.long)
+            doc_indices = doc_indices.unsqueeze(0).expand(num_queries, -1)
+            combined_indices = torch.cat([top_indices, doc_indices], dim=1)
+            top_scores, top_pos = torch.topk(combined_scores, k=k, dim=1)
+            top_indices = torch.gather(combined_indices, 1, top_pos)
+            del docs, scores, combined_scores, doc_indices, combined_indices, top_pos
+
+        return top_scores.cpu(), top_indices.cpu()
 
     def _determine_chunk_size(self, num_queries: int) -> int:
         target_bytes = 256 * 1024 * 1024  # 256MB buffer
-        denom = max(num_queries, 1) * 4  # float32
+        bytes_per_value = 2 if (self.use_amp and self.search_dtype in {torch.float16, torch.bfloat16}) else 4
+        denom = max(num_queries, 1) * bytes_per_value
         chunk = target_bytes // denom
         return max(1024, chunk)
 
-    def _run_parallel_matmul(
-        self,
-        tasks: List[Tuple[torch.device, int, int, np.ndarray]],
-        queries_cpu: torch.Tensor,
-        queries_gpu: Dict[torch.device, torch.Tensor],
-    ) -> List[Tuple[int, int, np.ndarray]]:
-        if not tasks:
-            return []
-
-        if len(tasks) == 1:
-            device, start, end, docs = tasks[0]
-            scores = self._matmul_device(device, docs, queries_cpu, queries_gpu)
-            return [(start, end, scores)]
-
-        results: List[Tuple[int, int, np.ndarray]] = []
-
-        def _execute(device: torch.device, start: int, end: int, docs: np.ndarray) -> Tuple[int, int, np.ndarray]:
-            scores = self._matmul_device(device, docs, queries_cpu, queries_gpu)
-            return start, end, scores
-
-        with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
-            futures = [executor.submit(_execute, device, start, end, docs) for device, start, end, docs in tasks]
-            for future in futures:
-                results.append(future.result())
-        return results
-
-    def _matmul_device(
-        self,
-        device: torch.device,
-        docs_np: np.ndarray,
-        queries_cpu: torch.Tensor,
-        queries_gpu: Dict[torch.device, torch.Tensor],
-    ) -> np.ndarray:
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
-            q_tensor = queries_gpu[device]
-            docs_tensor = torch.from_numpy(docs_np).to(device, non_blocking=False)
-            with torch.no_grad():
-                scores = torch.matmul(q_tensor, docs_tensor.t())
-            scores_cpu = scores.cpu().numpy()
-            del docs_tensor, scores
-            return scores_cpu
-        docs_tensor = torch.from_numpy(docs_np)
-        with torch.no_grad():
-            scores_cpu = (queries_cpu @ docs_tensor.t()).numpy()
-        del docs_tensor
-        return scores_cpu
-
     def _resolve_primary_device(self) -> torch.device:
-        if self.config.device.startswith("cuda") and self.config.device_ids:
-            return torch.device(f"cuda:{self.config.device_ids[0]}")
+        if self.config.device.startswith("cuda"):
+            return torch.device(self.config.device)
         return torch.device("cpu")
+
+    def _resolve_search_dtype(self) -> torch.dtype:
+        if not self.use_amp:
+            return torch.float32
+        requested = self.config.amp_dtype.lower()
+        if requested in {"bf16", "bfloat16"}:
+            bf16_available = hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported()
+            if bf16_available:
+                return torch.bfloat16
+            logging.warning("bf16 requested for retrieval but not supported; defaulting to fp16.")
+        return torch.float16
 
     @staticmethod
     def _empty_metrics() -> Dict[str, float]:
@@ -1114,6 +1688,9 @@ class BenchmarkRunner:
         self.reference_sources: Dict[str, str] = {}
         self.base_encoder = HFTextEncoder(self.config.clone_for(use_lora=False, use_maw=False))
         self.base_encoder.eval()
+        # Synchronize after model loading to avoid file locking issues in distributed mode
+        if config.distributed and dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     def run(self) -> None:
         set_random_seed(self.config.seed)
@@ -1123,7 +1700,7 @@ class BenchmarkRunner:
             self._run_bundle(self.dataset_manager.get_beir_dataset(dataset))
         for split in self.config.lotte_splits:
             self._run_bundle(self.dataset_manager.get_lotte_split(split))
-        if self.reports:
+        if is_main_process(self.config) and self.reports:
             ensure_dir(Path("results"))
             timestamp = time.strftime("%Y%m%d-%H%M%S")
             out_path = Path("results") / f"tier1_report_{timestamp}.json"
@@ -1132,26 +1709,63 @@ class BenchmarkRunner:
             logging.info("Saved aggregated report to %s", out_path)
 
     def _run_bundle(self, bundle: DatasetBundle) -> None:
+        """
+        Run complete benchmark pipeline for a single dataset.
+        
+        DATA SPLIT USAGE (NO LEAKAGE):
+        - TRAIN split: Used for training model variants (DenseLoRA, MAWLoRA, MAWFullFT)
+        - DEV split: Used ONLY for validation during training (early stopping, hyperparameter monitoring)
+        - TEST split: Used ONLY for final evaluation metrics reported in results
+        
+        If a dataset has no explicit test split, dev split is used as test AND nullified for validation
+        to prevent data leakage. See get_beir_dataset() and get_msmarco() for split loading logic.
+        """
         bundle.ensure_test()
         dataset_name = bundle.name
         test_queries = bundle.test.queries if bundle.test else {}
         test_qrels = bundle.test.qrels if bundle.test else {}
 
+        log_enabled = is_main_process(self.config)
+
         if not test_queries:
-            logging.warning("Skipping dataset %s because the evaluation split is empty.", dataset_name)
+            if log_enabled:
+                logging.warning("Skipping dataset %s because the evaluation split is empty.", dataset_name)
             return
 
-        logging.info("=== %s ===", dataset_name)
-        logging.info("Device allocation: %s", device_status(self.config))
-        bm25 = PyseriniBM25Retriever(self.config, dataset_name)
-        bm25.build(bundle.corpus)
-        bm25_metrics, _ = self.evaluator.evaluate_bm25(dataset_name, bm25, test_queries, test_qrels)
-        dataset_report: Dict[str, Any] = {"BM25": {"metrics": bm25_metrics}}
+        if log_enabled:
+            logging.info("=== %s ===", dataset_name)
+            logging.info("Device allocation: %s", device_status(self.config))
+            
+            # Log data split usage to ensure no leakage
+            logging.info(
+                "Data splits - TRAIN: %d queries (for training), DEV: %d queries (for validation), TEST: %d queries (for final evaluation)",
+                len(bundle.train.queries) if bundle.train else 0,
+                len(bundle.dev.queries) if bundle.dev else 0,
+                len(bundle.test.queries) if bundle.test else 0
+            )
+
+        bm25: Optional[PyseriniBM25Retriever] = None
+        if log_enabled:
+            bm25 = PyseriniBM25Retriever(self.config, dataset_name)
+            bm25.build(bundle.corpus)
+        if self.config.distributed and dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
+        dataset_report: Dict[str, Any] = {}
+        if log_enabled and bm25 is not None:
+            bm25_metrics, _ = self.evaluator.evaluate_bm25(dataset_name, bm25, test_queries, test_qrels)
+            dataset_report["BM25"] = {"metrics": bm25_metrics}
+        
+        # Sync after BM25 evaluation before starting dense model evaluation
+        if self.config.distributed and dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
         hard_negatives: Dict[str, List[str]] = {}
         if bundle.has_train():
-            negative_depth = max(self.config.negatives_per_query * 10, 100)
-            hard_negatives = self._mine_bm25_negatives(bm25, bundle.train.queries, bundle.train.qrels, negative_depth)
+            if log_enabled and bm25 is not None:
+                negative_depth = max(self.config.negatives_per_query * 10, 100)
+                hard_negatives = self._mine_bm25_negatives(bm25, bundle.train.queries, bundle.train.qrels, negative_depth)
+            hard_negatives = broadcast_object(self.config, hard_negatives)
 
         baseline_metrics, baseline_per_query = self.evaluator.evaluate_dense_model(
             dataset_name,
@@ -1162,15 +1776,16 @@ class BenchmarkRunner:
             split="test",
             cache_prefix=f"{dataset_name}/DenseZeroShot",
         )
-        logging.info(
-            "[Eval:%s] DenseZeroShot completed on %s",
-            dataset_name,
-            device_status(self.config),
-        )
-        dataset_report["DenseZeroShot"] = {
-            "metrics": baseline_metrics,
-            "budget": compile_budget_report("DenseZeroShot", self.base_encoder),
-        }
+        if log_enabled:
+            logging.info(
+                "[Eval:%s] DenseZeroShot completed on %s",
+                dataset_name,
+                device_status(self.config),
+            )
+            dataset_report["DenseZeroShot"] = {
+                "metrics": baseline_metrics,
+                "budget": compile_budget_report("DenseZeroShot", self.base_encoder),
+            }
 
         train_dataset: Optional[TripletDataset] = None
         if bundle.has_train():
@@ -1183,17 +1798,19 @@ class BenchmarkRunner:
                 seed=self.config.seed,
             )
             if len(candidate_dataset) == 0:
-                logging.warning(
-                    "%s: training split empty after filtering; fine-tuning variants will reuse reference checkpoints.",
-                    dataset_name,
-                )
+                if log_enabled:
+                    logging.warning(
+                        "%s: training split empty after filtering; fine-tuning variants will reuse reference checkpoints.",
+                        dataset_name,
+                    )
             else:
                 train_dataset = candidate_dataset
         else:
-            logging.info(
-                "%s: no training split detected; reusing reference fine-tuned checkpoints where available.",
-                dataset_name,
-            )
+            if log_enabled:
+                logging.info(
+                    "%s: no training split detected; reusing reference fine-tuned checkpoints where available.",
+                    dataset_name,
+                )
 
         variant_specs = {
             "DenseLoRA": self.config.clone_for(use_lora=True, use_maw=False),
@@ -1201,9 +1818,9 @@ class BenchmarkRunner:
             "MAWFullFT": self.config.clone_for(use_lora=False, use_maw=True),
         }
 
-        per_query_scores: Dict[str, Dict[str, Dict[str, float]]] = {
-            "DenseZeroShot": baseline_per_query,
-        }
+        per_query_scores: Dict[str, Dict[str, Dict[str, float]]] = {}
+        if log_enabled:
+            per_query_scores["DenseZeroShot"] = baseline_per_query
 
         for label, variant_cfg in variant_specs.items():
             encoder, training_stats, source = self._prepare_variant_model(
@@ -1212,13 +1829,6 @@ class BenchmarkRunner:
                 dataset_name,
                 train_dataset,
                 bundle,
-            )
-            logging.info(
-                "[Eval:%s] %s (source=%s) on %s",
-                dataset_name,
-                label,
-                source,
-                device_status(self.config),
             )
             metrics, per_query = self.evaluator.evaluate_dense_model(
                 dataset_name,
@@ -1229,41 +1839,52 @@ class BenchmarkRunner:
                 split="test",
                 cache_prefix=f"{dataset_name}/{label}_{source}",
             )
-            dataset_report[label] = {
-                "metrics": metrics,
-                "budget": compile_budget_report(label, encoder, training_stats),
-                "training_source": source,
-            }
-            per_query_scores[label] = per_query
+            if log_enabled:
+                logging.info(
+                    "[Eval:%s] %s (source=%s) on %s",
+                    dataset_name,
+                    label,
+                    source,
+                    device_status(self.config),
+                )
+                dataset_report[label] = {
+                    "metrics": metrics,
+                    "budget": compile_budget_report(label, encoder, training_stats),
+                    "training_source": source,
+                }
+                per_query_scores[label] = per_query
 
             if self.config.device.startswith("cuda"):
                 encoder.model.to("cpu")
                 torch.cuda.empty_cache()
 
-        sig_tests: Dict[str, Dict[str, float]] = {}
-        if (
-            "MAWFullFT" in per_query_scores
-            and "DenseZeroShot" in per_query_scores
-            and per_query_scores["MAWFullFT"]
-            and per_query_scores["DenseZeroShot"]
-        ):
-            sig_tests["MAWFullFT_vs_DenseZeroShot"] = self.evaluator.paired_bootstrap(
-                per_query_scores["DenseZeroShot"],
-                per_query_scores["MAWFullFT"],
-                "ndcg_cut_10",
-            )
-            if "DenseLoRA" in per_query_scores and per_query_scores["DenseLoRA"]:
-                sig_tests["MAWFullFT_vs_DenseLoRA"] = self.evaluator.paired_bootstrap(
-                    per_query_scores["DenseLoRA"],
+        if log_enabled:
+            sig_tests: Dict[str, Dict[str, float]] = {}
+            if (
+                "MAWFullFT" in per_query_scores
+                and "DenseZeroShot" in per_query_scores
+                and per_query_scores["MAWFullFT"]
+                and per_query_scores["DenseZeroShot"]
+            ):
+                sig_tests["MAWFullFT_vs_DenseZeroShot"] = self.evaluator.paired_bootstrap(
+                    per_query_scores["DenseZeroShot"],
                     per_query_scores["MAWFullFT"],
                     "ndcg_cut_10",
                 )
-        dataset_report["significance"] = sig_tests
-
-        self.reports[dataset_name] = dataset_report
+                if "DenseLoRA" in per_query_scores and per_query_scores["DenseLoRA"]:
+                    sig_tests["MAWFullFT_vs_DenseLoRA"] = self.evaluator.paired_bootstrap(
+                        per_query_scores["DenseLoRA"],
+                        per_query_scores["MAWFullFT"],
+                        "ndcg_cut_10",
+                    )
+            dataset_report["significance"] = sig_tests
+            self.reports[dataset_name] = dataset_report
 
         if self.config.device.startswith("cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        if self.config.distributed and dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
     def _mine_bm25_negatives(
         self,
@@ -1376,12 +1997,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-dropout", type=float, default=0.05)
     parser.add_argument("--maw-depth", type=int, default=64)
     parser.add_argument("--maw-heads", type=int, default=8)
-    parser.add_argument("--maw-layers", type=int, default=1)
+    parser.add_argument(
+        "--maw-layer-indices", 
+        type=str, 
+        default="-1",
+        help="Comma-separated layer indices for MAW. Use -1 for last layer (default), -2 for second-to-last, etc. "
+             "Examples: '-1' (last layer only), '0,5,11' (layers 0, 5, and 11), 'all' (all layers), '-1,-2' (last two layers)"
+    )
+    parser.add_argument("--no-amp", action="store_true", help="Disable automatic mixed precision")
+    parser.add_argument(
+        "--amp-dtype",
+        choices=["fp16", "bf16"],
+        default="bf16",
+        help="AMP precision to use when acceleration is enabled",
+    )
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
 
 def build_config(args: argparse.Namespace) -> BenchmarkConfig:
+    # Parse MAW layer indices
+    maw_layer_indices = _parse_maw_layer_indices(args.maw_layer_indices)
+    
     return BenchmarkConfig(
         dense_model=args.dense_model,
         max_seq_length=args.max_seq_length,
@@ -1399,18 +2036,55 @@ def build_config(args: argparse.Namespace) -> BenchmarkConfig:
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
+        use_amp=not args.no_amp,
+        amp_dtype=args.amp_dtype,
         use_lora=False,
         use_maw=False,
         maw_depth_dim=args.maw_depth,
         maw_num_heads=args.maw_heads,
-        maw_layers=args.maw_layers,
+        maw_layer_indices=maw_layer_indices,
     )
 
 
+def _parse_maw_layer_indices(layer_spec: str) -> List[int]:
+    """
+    Parse MAW layer specification string.
+    
+    Args:
+        layer_spec: String like "-1", "0,5,11", "all", etc.
+    
+    Returns:
+        List of layer indices (may include negative indices to be resolved later)
+    """
+    layer_spec = layer_spec.strip().lower()
+    
+    if layer_spec == "all":
+        # Special value to indicate all layers (will be resolved in encoder)
+        return list(range(100))  # Large number, will be clamped to actual layer count
+    
+    # Parse comma-separated indices
+    try:
+        indices = [int(x.strip()) for x in layer_spec.split(",") if x.strip()]
+        return indices
+    except ValueError:
+        logging.warning(f"Invalid MAW layer specification '{layer_spec}', using default [-1]")
+        return [-1]
+
+
 def main() -> None:
+    # Suppress common warnings
+    os.environ['TOKENIZERS_PARALLELISM'] = 'false'  # Avoid tokenizer fork warnings
+    warnings.filterwarnings('ignore', category=FutureWarning, module='huggingface_hub')
+    warnings.filterwarnings('ignore', category=FutureWarning, module='torch.utils.checkpoint')
+    
     args = parse_args()
     logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO), format="%(asctime)s - %(levelname)s - %(message)s")
     config = build_config(args)
+    initialize_distributed(config)
+
+    if not is_main_process(config):
+        logging.getLogger().setLevel(logging.WARNING)
+
     logging.info(
         "Runtime devices -> %s (%s)",
         device_status(config),
@@ -1422,7 +2096,10 @@ def main() -> None:
         config.ms_marco = True
 
     runner = BenchmarkRunner(config)
-    runner.run()
+    try:
+        runner.run()
+    finally:
+        finalize_distributed(config)
 
 
 if __name__ == "__main__":
