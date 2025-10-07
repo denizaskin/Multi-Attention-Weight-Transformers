@@ -1,0 +1,1 @@
+python tier1_fixed.py --msmarco --skip-bm25

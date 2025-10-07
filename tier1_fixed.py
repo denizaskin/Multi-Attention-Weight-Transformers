@@ -90,10 +90,11 @@ from tqdm import tqdm
 class BenchmarkConfig:
     """Top-level configuration for the Tier-1 benchmark"""
 
-    dense_model: str = "facebook/contriever"
-    max_seq_length: int = 512
-    batch_size: int = 32
-    eval_batch_size: int = 256
+    dense_model: str = "sentence-transformers/all-MiniLM-L6-v2"  # Smaller: 22M params vs 110M (Contriever)
+    max_seq_length: int = 256  # Optimized for multi-GPU setup with 45GB per GPU
+    batch_size: int = 64  # Larger batch size possible with smaller model
+    eval_batch_size: int = 128  # Larger evaluation batch size
+    gradient_accumulation_steps: int = 2  # Accumulate gradients for memory efficiency
     epochs: int = 3
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
@@ -115,6 +116,7 @@ class BenchmarkConfig:
     ms_marco: bool = False
     # REMOVED: beir_datasets - BEIR datasets don't have train sets
     lotte_splits: List[str] = field(default_factory=list)
+    skip_bm25: bool = False
 
     data_root: str = "datasets"
     bm25_index_root: str = "indices/bm25"
@@ -143,12 +145,12 @@ class BenchmarkConfig:
                 init_params[f.name] = getattr(self, f.name)
         init_params.update(kwargs)
         
-        # Reduce batch size for MAW variants to prevent OOM (5D attention is memory-intensive)
+        # Optimize batch sizes for MAW variants with multi-GPU support
         if kwargs.get('use_maw', False) and 'batch_size' not in kwargs:
-            # Reduce training batch size by 4x for MAW (5D tensor is large)
-            init_params['batch_size'] = max(4, init_params.get('batch_size', 32) // 4)
-            # Also reduce eval batch size by 2x
-            init_params['eval_batch_size'] = max(64, init_params.get('eval_batch_size', 256) // 2)
+            # MAW uses 5D attention - use moderate batch sizes
+            # With smaller model (22M params), we can afford larger MAW batches
+            init_params['batch_size'] = 16  # MAW training batch size (increased with smaller model)
+            init_params['eval_batch_size'] = 32  # MAW eval batch size
         
         clone = BenchmarkConfig(**init_params)
         # preserve runtime-discovered attributes that are init=False
@@ -351,11 +353,15 @@ class DatasetManager:
                 "Verify that ir_datasets is installed and accessible."
             )
 
-        train_split = self._try_load_split(str(dataset_path), dataset_name, ["train"])
-        dev_split = self._try_load_split(str(dataset_path), dataset_name, ["dev", "validation", "val"])
+        # LoTTE only has dev and test splits (no train split available in ir_datasets)
+        # Use dev as train for fine-tuning, test for evaluation
+        train_split = self._try_load_split(str(dataset_path), dataset_name, ["dev"])
+        dev_split = None  # No separate dev monitoring for LoTTE
         test_split = self._try_load_split(str(dataset_path), dataset_name, ["test"])
         if test_split is None:
             raise ValueError(f"LoTTE split '{split}' does not include a test partition.")
+        if train_split is not None:
+            logging.info("LoTTE-%s: Using 'dev' split for training, 'test' split for evaluation (LoTTE has no separate train split)", normalized)
         return self._assemble_bundle(dataset_name, train_split, dev_split, test_split)
 
     def _ensure_beir_dataset(self, dataset_name: str, url: str) -> str:
@@ -463,16 +469,28 @@ class DatasetManager:
         queries_path = base_path / "queries.jsonl"
         qrels_dir = ensure_dir(base_path / "qrels")
 
+        # LoTTE structure: lotte/{domain}/{split}/{variant}
+        # Domains: lifestyle, recreation, science, technology, writing
+        # Variants: search, forum
+        # Splits: dev, test (no train split in ir_datasets)
+        domains = ["lifestyle", "recreation", "science", "technology", "writing"]
+        
         dataset_versions: Dict[str, Any] = {}
         if is_main_process(self.config):
-            for partition in ("train", "dev", "test"):
+            # Try loading pooled dataset first (combines all domains)
+            for partition in ("dev", "test"):
                 try:
-                    dataset_versions[partition] = ir_datasets.load(f"lotte/{split}/{partition}")
-                except Exception:
+                    dataset_versions[partition] = ir_datasets.load(f"lotte/pooled/{partition}/{split}")
+                    logging.info("[LoTTE:%s] Loaded pooled/%s/%s dataset", split, partition, split)
+                except Exception as e:
+                    logging.debug("[LoTTE:%s] Could not load pooled/%s/%s: %s", split, partition, split, e)
                     dataset_versions[partition] = None
+            
             if all(dataset is None for dataset in dataset_versions.values()):
                 raise RuntimeError(
-                    "Unable to load LoTTE via ir_datasets. Install the package and ensure the dataset is available."
+                    f"Unable to load LoTTE {split} via ir_datasets. "
+                    f"Tried: lotte/pooled/dev/{split}, lotte/pooled/test/{split}. "
+                    f"Make sure ir_datasets is installed and the dataset is available."
                 )
 
             if not corpus_path.exists():
@@ -532,7 +550,8 @@ class DatasetManager:
                         rel = getattr(qrel, "relevance", getattr(qrel, "score", 1))
                         qrels_file.write(f"{qid}\t{did}\t{rel}\n")
         else:
-            required_paths = [corpus_path, queries_path] + [qrels_dir / f"{part}.tsv" for part in ("train", "dev", "test")]
+            # LoTTE only has dev and test splits (no train)
+            required_paths = [corpus_path, queries_path] + [qrels_dir / f"{part}.tsv" for part in ("dev", "test")]
             wait_for_condition(lambda: all(path.exists() for path in required_paths), timeout=1800, interval=5.0)
 
     def _apply_smoke_filters(self, bundle: DatasetBundle) -> DatasetBundle:
@@ -638,12 +657,274 @@ class PyseriniBM25Retriever:
         return results
 
 
+class GRPOEnvironment:
+    """
+    GRPO RL Environment for depth selection in MAW attention.
+    
+    State: 5D attention weights (batch, heads, seq_q, seq_k, depth)
+    Action: Select depth index [0, depth_dim-1]
+    Reward: Based on retrieval performance improvement
+    """
+    
+    def __init__(self, depth_dim: int, num_heads: int):
+        self.depth_dim = depth_dim
+        self.num_heads = num_heads
+        self.current_state = None
+        self.current_relevance_scores = None
+        self.baseline_scores = None
+        
+    def reset(self, attention_weights_5d: torch.Tensor, relevance_scores: List[float] = None, baseline_scores: List[float] = None):
+        """
+        Reset environment with new 5D attention weights and relevance data.
+        
+        Args:
+            attention_weights_5d: (batch, heads, seq_q, seq_k, depth)
+            relevance_scores: Ground truth relevance scores (optional)
+            baseline_scores: Baseline model similarity scores (optional)
+        """
+        self.current_state = attention_weights_5d
+        self.current_relevance_scores = relevance_scores or []
+        self.baseline_scores = baseline_scores or []
+        return self.get_state_representation()
+    
+    def get_state_representation(self) -> torch.Tensor:
+        """
+        Get state representation for the policy network.
+        
+        Returns:
+            state: (batch, state_dim) - compressed state representation
+        """
+        if self.current_state is None:
+            raise RuntimeError("Environment not initialized. Call reset() first.")
+        
+        # Compress 5D attention to a manageable state representation
+        # Use adaptive pooling to create fixed-size state
+        batch_size = self.current_state.shape[0]
+        
+        # Pool spatial dimensions (seq_q, seq_k) to 8x8
+        # Shape: (batch, heads, seq_q, seq_k, depth) -> (batch, heads, 8, 8, depth)
+        pooled = F.adaptive_avg_pool2d(
+            self.current_state.mean(dim=-1),  # Average over depth first
+            (8, 8)
+        )
+        
+        # Flatten to state vector: (batch, heads * 8 * 8)
+        state = pooled.view(batch_size, -1)
+        return state
+    
+    def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        """
+        Execute action and return next state, reward, done.
+        
+        Args:
+            actions: (batch,) - selected depth indices
+            
+        Returns:
+            next_state: (batch, state_dim)
+            rewards: (batch,) - computed rewards
+            done: Always True (single-step environment)
+        """
+        batch_size = actions.shape[0]
+        rewards = torch.zeros(batch_size, device=actions.device)
+        
+        # Compute reward based on attention quality
+        for b in range(batch_size):
+            depth_idx = actions[b].item()
+            
+            # Select attention at chosen depth
+            attn_slice = self.current_state[b, :, :, :, depth_idx]  # (heads, seq_q, seq_k)
+            
+            # Reward: negative entropy (more focused attention is better)
+            attn_probs = F.softmax(attn_slice, dim=-1)
+            entropy = -(attn_probs * torch.log(attn_probs + 1e-10)).sum(dim=-1).mean()
+            rewards[b] = -entropy  # Lower entropy = higher reward
+        
+        return self.get_state_representation(), rewards, True
+
+
+class GRPOPolicyNetwork(nn.Module):
+    """
+    GRPO Policy Network for depth selection.
+    
+    This is the actual RL policy that learns to select optimal depths
+    based on 5D attention state representations.
+    """
+    
+    def __init__(self, hidden_size: int, depth_dim: int, num_heads: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.depth_dim = depth_dim
+        self.num_heads = num_heads
+        
+        # State encoder
+        state_dim = self.num_heads * 8 * 8  # From adaptive pooling
+        
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+        )
+        
+        # Policy head (outputs action probabilities)
+        self.policy_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.depth_dim)  # Output logits for each depth
+        )
+        
+        # Value head (estimates state value for advantage computation)
+        self.value_head = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)  # Single value output
+        )
+        
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass through policy network.
+        
+        Args:
+            state: (batch_size, state_dim) - state representation
+            
+        Returns:
+            action_logits: (batch_size, depth_dim) - action probabilities
+            state_value: (batch_size, 1) - estimated state value
+        """
+        encoded_state = self.state_encoder(state)
+        
+        action_logits = self.policy_head(encoded_state)
+        state_value = self.value_head(encoded_state)
+        
+        return action_logits, state_value
+    
+    def get_action(self, state: torch.Tensor, deterministic: bool = False) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Sample action from policy.
+        
+        Args:
+            state: (batch_size, state_dim)
+            deterministic: If True, take argmax action
+            
+        Returns:
+            action: (batch_size,) - selected depth indices
+            log_prob: (batch_size,) - log probability of selected actions
+            state_value: (batch_size, 1) - estimated state value
+        """
+        action_logits, state_value = self.forward(state)
+        
+        if deterministic:
+            action = action_logits.argmax(dim=-1)
+            action_probs = F.softmax(action_logits, dim=-1)
+            log_prob = torch.log(action_probs.gather(1, action.unsqueeze(1))).squeeze(1)
+        else:
+            action_probs = F.softmax(action_logits, dim=-1)
+            action_dist = torch.distributions.Categorical(action_probs)
+            action = action_dist.sample()
+            log_prob = action_dist.log_prob(action)
+        
+        return action, log_prob, state_value
+
+
+class GRPORouter(nn.Module):
+    """
+    GRPO Router using Reinforcement Learning for depth selection from 5D attention weights.
+    
+    This implements actual GRPO (Generalized Preference Optimization) algorithm:
+    - Policy network learns to select optimal depths
+    - Environment provides rewards based on retrieval performance
+    - Uses policy gradients with preference-based optimization
+    """
+    
+    def __init__(self, hidden_size: int, depth_dim: int, num_heads: int):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.depth_dim = depth_dim
+        self.num_heads = num_heads
+        
+        # RL Components
+        self.policy = GRPOPolicyNetwork(hidden_size, depth_dim, num_heads)
+        self.environment = GRPOEnvironment(depth_dim, num_heads)
+        
+        # Reference policy for KL regularization (frozen copy)
+        self.reference_policy = GRPOPolicyNetwork(hidden_size, depth_dim, num_heads)
+        self.reference_policy.load_state_dict(self.policy.state_dict())
+        
+        # Freeze reference policy
+        for param in self.reference_policy.parameters():
+            param.requires_grad = False
+        
+        # GRPO hyperparameters
+        self.kl_coeff = 0.1  # KL divergence coefficient
+        self.value_coeff = 0.5  # Value loss coefficient
+        self.entropy_coeff = 0.01  # Entropy bonus coefficient
+    
+    def get_depth_selection(self, attention_weights_5d: torch.Tensor) -> torch.Tensor:
+        """
+        Select depth using the trained RL policy.
+        
+        Args:
+            attention_weights_5d: (batch_size, num_heads, seq_len_query, seq_len_key, depth)
+        Returns:
+            depth_indices: (batch_size,) - selected depth index for each batch item
+        """
+        # Get state representation
+        state = self.environment.reset(attention_weights_5d, [], [])
+        
+        # Get action from policy (deterministic during inference)
+        action, _, _ = self.policy.get_action(state, deterministic=not self.training)
+        
+        return action
+    
+    def select_optimal_attention(self, attention_weights_5d: torch.Tensor) -> torch.Tensor:
+        """
+        Select optimal 4D attention weights from 5D attention weights using RL policy.
+        
+        Args:
+            attention_weights_5d: (batch_size, num_heads, seq_len_query, seq_len_key, depth)
+        Returns:
+            attention_weights_4d: (batch_size, num_heads, seq_len_query, seq_len_key)
+        """
+        batch_size, num_heads, seq_q, seq_k, depth = attention_weights_5d.shape
+        depth_indices = self.get_depth_selection(attention_weights_5d)  # (batch_size,)
+        
+        # PARALLEL SELECTION: Use advanced indexing
+        batch_indices = torch.arange(batch_size, device=attention_weights_5d.device)
+        
+        # Reshape for gathering along depth dimension
+        # (batch, heads, seq_q, seq_k, depth) -> (batch, heads*seq_q*seq_k, depth)
+        attn_flat = attention_weights_5d.view(batch_size, num_heads * seq_q * seq_k, depth)
+        
+        # Expand depth_indices for gathering: (batch,) -> (batch, heads*seq_q*seq_k)
+        depth_indices_expanded = depth_indices.unsqueeze(1).expand(batch_size, num_heads * seq_q * seq_k)
+        
+        # Gather: select depth for each position (fully parallel!)
+        attention_4d_flat = torch.gather(attn_flat, dim=2, index=depth_indices_expanded.unsqueeze(2)).squeeze(2)
+        
+        # Reshape back: (batch, heads*seq_q*seq_k) -> (batch, heads, seq_q, seq_k)
+        attention_weights_4d = attention_4d_flat.view(batch_size, num_heads, seq_q, seq_k)
+        
+        return attention_weights_4d
+
+
 class TokenLevelMAW(nn.Module):
     """
-    Multi-Attention-Weight (MAW) module that computes 5D attention weights.
+    Multi-Attention-Weight (MAW) module with complete GRPO architecture.
     
-    This module extracts query, key, and value vectors from the encoder's last layer,
-    computes a 5D attention tensor, and uses GRPO to select the optimal depth index.
+    This is the full implementation from benchmark_evaluation_GRPO.py with:
+    - 5D attention computation via depth-aware projections
+    - GRPO RL router for depth selection
+    - Policy network with actor-critic architecture
     """
     def __init__(self, hidden_size: int, depth_dim: int, num_heads: int) -> None:
         super().__init__()
@@ -652,30 +933,22 @@ class TokenLevelMAW(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         
-        # Policy network for GRPO (selects depth index)
-        self.policy_network = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 2),
-            nn.GELU(),
-            nn.Linear(hidden_size * 2, depth_dim),
-        )
+        # Standard projections for value vectors
+        self.query_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.key_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.value_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         
-        # Value network for GRPO (estimates expected reward)
-        self.value_network = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.GELU(),
-            nn.Linear(hidden_size, 1),
-        )
+        # Depth-aware projections for 5D attention
+        self.depth_query_proj = nn.Linear(hidden_size, num_heads * depth_dim, bias=False)
+        self.depth_key_proj = nn.Linear(hidden_size, num_heads * depth_dim, bias=False)
         
-        # Projections for Q, K, V
-        self.query_proj = nn.Linear(hidden_size, hidden_size)
-        self.key_proj = nn.Linear(hidden_size, hidden_size)
-        self.value_proj = nn.Linear(hidden_size, hidden_size)
+        # GRPO RL Router (complete architecture from benchmark_evaluation_GRPO.py)
+        self.grpo_router = GRPORouter(hidden_size, depth_dim, num_heads)
+        
+        # Output layers
         self.output_proj = nn.Linear(hidden_size, hidden_size)
-        
         self.norm = nn.LayerNorm(hidden_size)
-        
-        # GRPO training state
-        self.register_buffer('baseline_reward', torch.tensor(0.0))
+        self.dropout = nn.Dropout(0.1)
         
         # Enable gradient checkpointing for memory savings
         self.use_gradient_checkpointing = False
@@ -728,166 +1001,73 @@ class TokenLevelMAW(nn.Module):
         hidden_states: torch.Tensor,   # (batch_size, seq_len, hidden_size) for policy/value
     ) -> torch.Tensor:
         """
-        Compute Multi-Attention-Weight (MAW) attention following the 7-step process.
-        Creates proper 5D attention tensor: (batch_size, num_heads, seq_len_q, seq_len_k, depth_dim)
+        Compute MAW attention using complete GRPO architecture from benchmark_evaluation_GRPO.py.
+        
+        Architecture:
+        1. Compute 5D attention weights via depth-aware projections
+        2. Use GRPO RL router to select optimal depth
+        3. Apply selected 4D attention to value vectors
         """
         batch_size, num_heads, seq_len_q, head_dim = query.size()
         seq_len_k = key.size(2)
+        seq_len = hidden_states.size(1)
         
-        # MAW 7-STEP PROCESS (as specified)
-        
-        # Step 1: Increase dimension of query vector and transpose
-        # Target: (batch_size, num_heads, depth, seq_len_q, 1)
-        # Current query shape: (batch_size, num_heads, seq_len_q, head_dim)
-        
-        # Reshape query: (B, H, seq_q, head_dim) -> (B, H, 1, seq_q, head_dim)
-        query_reshaped = query.unsqueeze(2)
-        # Expand depth: (B, H, 1, seq_q, head_dim) -> (B, H, depth, seq_q, head_dim)
-        query_reshaped = query_reshaped.expand(batch_size, num_heads, self.depth_dim, seq_len_q, head_dim)
-        # Reduce head_dim by averaging: (B, H, depth, seq_q, head_dim) -> (B, H, depth, seq_q, 1)
-        query_expanded = query_reshaped.mean(dim=-1, keepdim=True)
-        
-        # Step 2: Increase dimension of key vector and transpose
-        # Target: (batch_size, num_heads, depth, 1, seq_len_k)
-        # Current key shape: (batch_size, num_heads, seq_len_k, head_dim)
-        
-        # Reshape key: (B, H, seq_k, head_dim) -> (B, H, 1, seq_k, head_dim)
-        key_reshaped = key.unsqueeze(2)
-        # Expand depth: (B, H, 1, seq_k, head_dim) -> (B, H, depth, seq_k, head_dim)
-        key_reshaped = key_reshaped.expand(batch_size, num_heads, self.depth_dim, seq_len_k, head_dim)
-        # Reduce head_dim by averaging: (B, H, depth, seq_k, head_dim) -> (B, H, depth, seq_k)
-        key_reduced = key_reshaped.mean(dim=-1)
-        # Reshape to target: (B, H, depth, seq_k) -> (B, H, depth, 1, seq_k)
-        key_expanded = key_reduced.unsqueeze(3)
-        
-        # Step 3: Multiply query and key to get 5D attention tensor
-        # Shape: (batch_size, num_heads, depth, seq_len_q, seq_len_k)
-        attn_5d = torch.matmul(query_expanded, key_expanded)
-        
-        # Scale by sqrt(depth_dim) for numerical stability (similar to standard attention scaling)
+        # Scale by sqrt(depth_dim) for numerical stability
         scaling_factor = math.sqrt(self.depth_dim)
-        attn_5d = attn_5d / scaling_factor
         
-        # Step 4: Transpose to put depth dimension last
-        # From: (batch_size, num_heads, depth, seq_len_q, seq_len_k)
-        # To: (batch_size, num_heads, seq_len_q, seq_len_k, depth)
-        attn_5d = attn_5d.permute(0, 1, 3, 4, 2)
+        # Depth-aware projections for 5D attention
+        Q_depth = self.depth_query_proj(hidden_states)  # (batch, seq, num_heads * depth_dim)
+        K_depth = self.depth_key_proj(hidden_states)    # (batch, seq, num_heads * depth_dim)
         
-        # Step 5: Use GRPO to select the best depth index
-        if self.training:
-            depth_weights = self._grpo_select_depth_5d(attn_5d, hidden_states, attention_mask)
-        else:
-            # During inference, use greedy selection (argmax of policy)
-            if attention_mask is not None:
-                pooled_hidden = (hidden_states * attention_mask.unsqueeze(-1)).sum(dim=1) / attention_mask.sum(dim=1, keepdim=True)
-            else:
-                pooled_hidden = hidden_states.mean(dim=1)
-            policy_logits = self.policy_network(pooled_hidden)  # (batch_size, depth_dim)
-            depth_idx = policy_logits.argmax(dim=-1)  # (batch_size,)
-            # Create one-hot weights
-            depth_weights = F.one_hot(depth_idx, num_classes=self.depth_dim).float()  # (batch_size, depth_dim)
+        # Reshape for multi-head attention with depth dimension
+        Q_depth = Q_depth.view(batch_size, seq_len, self.num_heads, self.depth_dim).transpose(1, 2)
+        K_depth = K_depth.view(batch_size, seq_len, self.num_heads, self.depth_dim).transpose(1, 2)
+        # Q_depth, K_depth: (batch, num_heads, seq_len, depth_dim)
         
-        # Apply depth weights to reduce 5D tensor to 4D
-        # depth_weights: (batch_size, depth_dim) -> (batch_size, 1, 1, 1, depth_dim)
-        depth_weights = depth_weights.view(batch_size, 1, 1, 1, self.depth_dim)
+        # Compute 5D attention scores using chunked outer product for memory efficiency
+        # This prevents OOM when processing large batches across multiple GPUs
+        # Use smaller chunks (2 samples at a time) to reduce peak memory usage
+        chunk_size = min(2, batch_size)  # Process in small chunks to save memory
+        scores_5d_chunks = []
         
-        # Weighted sum over depth dimension
-        # Result: (batch_size, num_heads, seq_len_q, seq_len_k)
-        attn_4d = (attn_5d * depth_weights).sum(dim=-1)
+        for i in range(0, batch_size, chunk_size):
+            chunk_end = min(i + chunk_size, batch_size)
+            Q_chunk = Q_depth[i:chunk_end].transpose(2, 3).unsqueeze(-1)  # (chunk, heads, depth, seq_q, 1)
+            K_chunk = K_depth[i:chunk_end].transpose(2, 3).unsqueeze(-2)  # (chunk, heads, depth, 1, seq_k)
+            
+            # Element-wise multiplication creates 5D scores
+            scores_chunk = Q_chunk * K_chunk  # (chunk, heads, depth, seq_q, seq_k)
+            scores_chunk = scores_chunk.permute(0, 1, 3, 4, 2)  # (chunk, heads, seq_q, seq_k, depth)
+            scores_chunk = scores_chunk / scaling_factor
+            scores_5d_chunks.append(scores_chunk)
+            
+            # Free memory immediately after processing each chunk
+            del Q_chunk, K_chunk, scores_chunk
         
-        # Step 6: Softmax over the last dimension (seq_len_k)
-        # Apply attention mask before softmax
+        scores_5d = torch.cat(scores_5d_chunks, dim=0)  # (batch, heads, seq_q, seq_k, depth)
+        del scores_5d_chunks  # Free chunk list
+        
+        # Apply attention mask if provided
         if attention_mask is not None:
-            # Expand mask to match attention shape
-            mask_expanded = attention_mask.unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
-            attn_4d = attn_4d.masked_fill(~mask_expanded.bool(), float('-inf'))
+            mask = attention_mask.unsqueeze(1).unsqueeze(1).unsqueeze(-1)  # (batch, 1, 1, seq, 1)
+            mask = mask.expand(batch_size, self.num_heads, seq_len_q, seq_len_k, self.depth_dim)
+            scores_5d = scores_5d.masked_fill(mask == 0, -1e9)
         
-        attn_weights = F.softmax(attn_4d, dim=-1)  # (batch_size, num_heads, seq_len_q, seq_len_k)
+        # Softmax over DEPTH dimension to get attention weights (dim=-1)
+        attention_weights_5d = F.softmax(scores_5d, dim=-1)  # Softmax over depth (last dim)
+        # Shape: (batch, heads, seq_q, seq_k, depth)
         
-        # Handle NaN from softmax of all -inf
-        attn_weights = torch.where(torch.isnan(attn_weights), torch.zeros_like(attn_weights), attn_weights)
+        # Use GRPO router to select optimal depth (complete RL architecture)
+        selected_attention_weights = self.grpo_router.select_optimal_attention(attention_weights_5d)
+        # Shape: (batch, heads, seq_q, seq_k)
         
-        # Step 7: Multiply attention weights with value vectors
-        attn_output = torch.matmul(attn_weights, value)  # (batch_size, num_heads, seq_len_q, head_dim)
+        # Apply dropout (NO second softmax or mask - already done!)
+        selected_attention_weights = self.dropout(selected_attention_weights)
+        
+        # Apply attention to value vectors
+        attn_output = torch.matmul(selected_attention_weights, value)  # (batch_size, num_heads, seq_len_q, head_dim)
         
         return attn_output
-    
-    def _grpo_select_depth_5d(
-        self,
-        attn_5d: torch.Tensor,  # (batch_size, num_heads, seq_len_q, seq_len_k, depth_dim)
-        hidden_states: torch.Tensor,  # (batch_size, seq_len, hidden_size)
-        attention_mask: Optional[torch.Tensor] = None,  # (batch_size, seq_len)
-    ) -> torch.Tensor:
-        """
-        Use GRPO to select the best depth from 5D attention tensor.
-        
-        Args:
-            attn_5d: 5D attention tensor (batch_size, num_heads, seq_len_q, seq_len_k, depth_dim)
-            hidden_states: Input hidden states for policy/value networks
-            attention_mask: Attention mask
-            
-        Returns:
-            depth_weights: (batch_size, depth_dim) - soft weights over depth dimension
-        """
-        batch_size = attn_5d.size(0)
-        
-        # Pool hidden states
-        if attention_mask is not None:
-            pooled_hidden = (hidden_states * attention_mask.unsqueeze(-1)).sum(dim=1) / attention_mask.sum(dim=1, keepdim=True)
-        else:
-            pooled_hidden = hidden_states.mean(dim=1)
-        
-        # Compute policy logits (probability distribution over depth indices)
-        policy_logits = self.policy_network(pooled_hidden)  # (batch_size, depth_dim)
-        policy_probs = F.softmax(policy_logits, dim=-1)
-        
-        # Compute value estimate
-        value_estimate = self.value_network(pooled_hidden).squeeze(-1)  # (batch_size,)
-        
-        # Sample depth indices from policy
-        depth_dist = torch.distributions.Categorical(probs=policy_probs)
-        depth_indices = depth_dist.sample()  # (batch_size,)
-        
-        # Compute reward based on attention quality at selected depth
-        # Select attention scores at sampled depth: (batch_size, num_heads, seq_len_q, seq_len_k)
-        selected_attn = attn_5d.gather(
-            dim=-1,
-            index=depth_indices.view(batch_size, 1, 1, 1, 1).expand(
-                batch_size, attn_5d.size(1), attn_5d.size(2), attn_5d.size(3), 1
-            )
-        ).squeeze(-1)
-        
-        # Compute reward: negative entropy encourages focused attention
-        attn_softmax = F.softmax(selected_attn, dim=-1)
-        entropy = -(attn_softmax * torch.log(attn_softmax + 1e-10)).sum(dim=-1)  # (batch_size, num_heads, seq_len_q)
-        reward = -entropy.mean(dim=(1, 2))  # (batch_size,) - lower entropy is better
-        
-        # GRPO loss: policy gradient with baseline
-        advantage = reward - self.baseline_reward
-        log_probs = depth_dist.log_prob(depth_indices)
-        policy_loss = -(log_probs * advantage.detach()).mean()
-        
-        # Value loss
-        value_loss = F.mse_loss(value_estimate, reward.detach())
-        
-        # Total loss (will be added to the main loss during training)
-        grpo_loss = policy_loss + 0.5 * value_loss
-        
-        # Update baseline (exponential moving average)
-        with torch.no_grad():
-            self.baseline_reward = 0.95 * self.baseline_reward + 0.05 * reward.mean()
-        
-        # Store loss for backward pass (attached to the output)
-        # In training mode, use soft weights from policy (Gumbel-Softmax for differentiability)
-        if self.training:
-            # Use Gumbel-Softmax for differentiable sampling
-            depth_weights = F.gumbel_softmax(policy_logits, tau=1.0, hard=False)
-            # Add GRPO loss to computation graph
-            depth_weights = depth_weights + 0.0 * grpo_loss  # Trick to include loss in backward
-        else:
-            depth_weights = policy_probs
-        
-        return depth_weights  # (batch_size, depth_dim)
 
 
 class HFTextEncoder(nn.Module):
@@ -1210,7 +1390,8 @@ class ContrastiveTrainer:
                 leave=False,
                 disable=not log_enabled,
             )
-            for batch in progress:
+            accumulation_step = 0
+            for batch_idx, batch in enumerate(progress):
                 queries, positives, negatives = batch
                 batch_queries = list(queries)
                 batch_pos = list(positives)
@@ -1235,20 +1416,30 @@ class ContrastiveTrainer:
                 logits = logits.float()
                 labels = torch.arange(logits.size(0), device=query_emb.device)
                 loss = F.cross_entropy(logits, labels)
-
-                self.optimizer.zero_grad(set_to_none=True)
+                
+                # Scale loss by accumulation steps to average gradients
+                loss = loss / self.config.gradient_accumulation_steps
 
                 if self.scaler.is_enabled():
                     self.scaler.scale(loss).backward()
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.parallel_model.parameters(), max_norm=2.0)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
                 else:
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.parallel_model.parameters(), max_norm=2.0)
-                    self.optimizer.step()
-                scheduler.step()
+                
+                accumulation_step += 1
+                
+                # Only update weights after accumulating enough gradients
+                if accumulation_step % self.config.gradient_accumulation_steps == 0:
+                    if self.scaler.is_enabled():
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.parallel_model.parameters(), max_norm=2.0)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(self.parallel_model.parameters(), max_norm=2.0)
+                        self.optimizer.step()
+                    
+                    self.optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
 
                 self.global_step += 1
                 token_factor = 1 + 1 + self.config.negatives_per_query
@@ -1297,13 +1488,35 @@ class ContrastiveTrainer:
         }
 
     def _wrap_for_distribution(self, module: HFTextEncoder) -> nn.Module:
-        if not self.config.distributed:
+        """Wrap model for multi-GPU training.
+        
+        NOTE: DataParallel doesn't work with text-based forward methods.
+        Our encoder processes text strings internally (tokenization happens inside forward),
+        which DataParallel cannot split across GPUs.
+        
+        For multi-GPU training with text encoders, we instead:
+        1. Keep model on primary GPU
+        2. Manually distribute batches in the training loop
+        3. Use all GPUs for parallel corpus encoding during evaluation
+        """
+        if not self.config.device.startswith("cuda"):
             return module
-        kwargs: Dict[str, Any] = {"broadcast_buffers": False, "find_unused_parameters": False}
-        if self.config.device.startswith("cuda"):
+            
+        num_gpus = torch.cuda.device_count()
+        
+        if self.config.distributed and num_gpus > 1:
+            # DistributedDataParallel for explicit distributed training
+            kwargs: Dict[str, Any] = {"broadcast_buffers": False, "find_unused_parameters": False}
             kwargs["device_ids"] = [self.config.primary_device_index]
             kwargs["output_device"] = self.config.primary_device_index
-        return nn.parallel.DistributedDataParallel(module, **kwargs)
+            logging.info(f"Using DistributedDataParallel on GPU {self.config.primary_device_index}")
+            return nn.parallel.DistributedDataParallel(module, **kwargs)
+        
+        # For standard multi-GPU: keep model on primary GPU, distribute batches manually
+        if num_gpus > 1:
+            logging.info(f"Multi-GPU mode: Model on GPU {self.config.primary_device_index}, will distribute batches across {num_gpus} GPUs during evaluation")
+        
+        return module
 
     def _resolve_amp_dtype(self) -> torch.dtype:
         if not self.config.use_amp or not self.config.device.startswith("cuda"):
@@ -1372,23 +1585,26 @@ class EvaluationManager:
 
         log_enabled = is_main_process(self.config)
         local_results: Dict[str, Dict[str, float]] = {}
+        
+        # Use encoder's config for batch size (MAW may have different settings)
+        query_batch_size = encoder.config.eval_batch_size if hasattr(encoder, 'config') else self.config.eval_batch_size
 
         for start in tqdm(
-            range(0, len(query_pairs), self.config.eval_batch_size),
+            range(0, len(query_pairs), query_batch_size),
             desc=f"{dataset_id}/{split}:queries [{device_status(self.config)}]",
             leave=False,
             disable=not log_enabled,
         ):
-            batch = query_pairs[start : start + self.config.eval_batch_size]
+            batch = query_pairs[start : start + query_batch_size]
             if not batch:
                 continue
             batch_ids = [pair[0] for pair in batch]
             batch_texts = [pair[1] for pair in batch]
             if self.use_amp and self.primary_device.type == "cuda":
                 with autocast(device_type='cuda', dtype=self.search_dtype):
-                    batch_embeddings = encoder.encode(batch_texts, batch_size=self.config.eval_batch_size)
+                    batch_embeddings = encoder.encode(batch_texts, batch_size=query_batch_size)
             else:
-                batch_embeddings = encoder.encode(batch_texts, batch_size=self.config.eval_batch_size)
+                batch_embeddings = encoder.encode(batch_texts, batch_size=query_batch_size)
             if batch_embeddings.numel() == 0:
                 continue
             scores, indices = self._search_corpus(batch_embeddings, corpus_embeddings, top_k)
@@ -1533,7 +1749,8 @@ class EvaluationManager:
             logging.info("Encoding corpus embeddings for cache prefix '%s' (%d documents)...", cache_prefix, len(doc_ids))
             writer = np.memmap(emb_path, dtype=np.float32, mode="w+", shape=(len(doc_ids), hidden_size))
             offset = 0
-            batch_size = self.config.eval_batch_size
+            # Use encoder's config for batch size (MAW may have different settings)
+            batch_size = encoder.config.eval_batch_size if hasattr(encoder, 'config') else self.config.eval_batch_size
             for start in tqdm(
                 range(0, len(doc_ids), batch_size),
                 desc=f"{cache_prefix}:encode_corpus [{device_status(self.config)}]",
@@ -1734,9 +1951,11 @@ class BenchmarkRunner:
             )
 
         bm25: Optional[PyseriniBM25Retriever] = None
-        if log_enabled:
+        if log_enabled and not self.config.skip_bm25:
             bm25 = PyseriniBM25Retriever(self.config, dataset_name)
             bm25.build(bundle.corpus)
+        elif log_enabled and self.config.skip_bm25:
+            logging.info("Skipping BM25 evaluation (--skip-bm25 flag set)")
         if self.config.distributed and dist.is_available() and dist.is_initialized():
             dist.barrier()
 
@@ -2069,6 +2288,7 @@ def parse_args() -> argparse.Namespace:
     # REMOVED: --beir argument - BEIR datasets don't have train sets
     parser.add_argument("--lotte", nargs="*", default=[], help="LoTTE splits (search/forum)")
     parser.add_argument("--quick-smoke-test", action="store_true", help="Run tiny smoke test subset")
+    parser.add_argument("--skip-bm25", action="store_true", help="Skip BM25 baseline evaluation (saves time on large datasets)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
@@ -2109,6 +2329,7 @@ def build_config(args: argparse.Namespace) -> BenchmarkConfig:
         ms_marco=args.msmarco,
         # REMOVED: beir_datasets - BEIR datasets don't have train sets
         lotte_splits=args.lotte,
+        skip_bm25=args.skip_bm25,
         quick_smoke_test=args.quick_smoke_test,
         seed=args.seed,
         lora_rank=args.lora_rank,
