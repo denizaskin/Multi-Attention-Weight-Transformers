@@ -7,11 +7,12 @@ This codebase now **ONLY supports datasets with training sets** for fine-tuning 
 ## ✅ Supported Datasets
 
 ### 1. **MS MARCO** (Default)
-- **Train**: 502,939 queries
-- **Dev**: 6,980 queries  
-- **Test**: 43 queries
+- **Train**: 502,939 queries (for training)
+- **Dev**: 6,980 queries (BEIR version uses this as test set)
+- **Test**: 6,980 queries (same as dev - no separate test in BEIR)
 - **Usage**: `--msmarco`
 - **Description**: Microsoft Machine Reading Comprehension dataset with web passages
+- **Note**: Code automatically uses dev split as test to prevent data leakage
 
 ### 2. **LoTTE** (Long-Tail Topic-stratified Evaluation)
 - **Splits**: `search` and `forum`

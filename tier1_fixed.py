@@ -328,11 +328,11 @@ class DatasetManager:
         dataset_path = self._ensure_beir_dataset(dataset_name, "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/msmarco.zip")
         train_split = self._try_load_split(dataset_path, dataset_name, ["train"])
         dev_split = self._try_load_split(dataset_path, dataset_name, ["dev", "validation", "val"])
-        test_split = self._try_load_split(dataset_path, dataset_name, ["test"])
-        if test_split is None and dev_split is not None:
-            logging.info("MS MARCO missing explicit test split; using dev split for final evaluation and disabling dev monitoring.")
-            test_split = dev_split
-            dev_split = None
+        # MS MARCO's "test" split only has 43 queries (not useful for evaluation)
+        # The standard practice is to use "dev" (6,980 queries) as the test set
+        logging.info("MS MARCO: Using dev split (6,980 queries) as test set (standard practice)")
+        test_split = dev_split
+        dev_split = None  # No separate dev monitoring for MS MARCO
         return self._assemble_bundle(dataset_name, train_split, dev_split, test_split)
 
     # REMOVED: get_beir_dataset() - BEIR datasets typically don't have train sets
@@ -607,24 +607,34 @@ class PyseriniBM25Retriever:
         
         self.doc_ids = list(corpus.keys())
         self.tokenized_corpus = []
-        for doc_id in self.doc_ids:
+        
+        logging.info("Tokenizing %d documents for BM25 (this may take several minutes)...", len(self.doc_ids))
+        tokenize_start = time.time()
+        for doc_id in tqdm(self.doc_ids, desc="Tokenizing documents"):
             doc_text = corpus[doc_id].get("title", "") + " " + corpus[doc_id].get("text", "")
             tokens = doc_text.lower().split()
             self.tokenized_corpus.append(tokens)
+        tokenize_time = time.time() - tokenize_start
+        logging.info("Tokenization complete in %.1f seconds", tokenize_time)
         
+        logging.info("Building BM25 index (computing term statistics, ~2-5 minutes for 8M docs)...")
+        index_start = time.time()
         self.bm25 = BM25Okapi(self.tokenized_corpus, k1=0.9, b=0.4)
-        logging.info("BM25 index built for %s", self.dataset_name)
+        index_time = time.time() - index_start
+        logging.info("BM25 index built for %s in %.1f seconds", self.dataset_name, index_time)
 
     def search(self, queries: Dict[str, str], top_k: int) -> Dict[str, Dict[str, float]]:
         if self.bm25 is None:
             raise RuntimeError("BM25 index has not been built")
         
+        logging.info("Running BM25 search for %d queries (top_k=%d)...", len(queries), top_k)
         results: Dict[str, Dict[str, float]] = {}
-        for qid, query_text in queries.items():
+        for qid, query_text in tqdm(queries.items(), desc="BM25 search"):
             tokenized_query = query_text.lower().split()
             scores = self.bm25.get_scores(tokenized_query)
             top_indices = np.argsort(scores)[::-1][:top_k]
             results[qid] = {self.doc_ids[idx]: float(scores[idx]) for idx in top_indices if scores[idx] > 0}
+        logging.info("BM25 search complete for %d queries", len(queries))
         return results
 
 
@@ -1858,12 +1868,101 @@ class BenchmarkRunner:
                     )
             dataset_report["significance"] = sig_tests
             self.reports[dataset_name] = dataset_report
+            
+            # Save BEST_RESULTS.json for this dataset
+            self._save_best_results(dataset_name, dataset_report)
 
         if self.config.device.startswith("cuda") and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         if self.config.distributed and dist.is_available() and dist.is_initialized():
             dist.barrier()
+
+    def _save_best_results(self, dataset_name: str, dataset_report: Dict[str, Any]) -> None:
+        """
+        Save BEST_RESULTS.json for each dataset containing all methods and their evaluation metrics.
+        For methods that require training, includes hyperparameters used.
+        """
+        ensure_dir(Path("results"))
+        best_results_path = Path("results") / f"{dataset_name}_BEST_RESULTS.json"
+        
+        best_results = {
+            "dataset": dataset_name,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "methods": {}
+        }
+        
+        # Extract results for each method
+        for method_name, method_data in dataset_report.items():
+            if method_name == "significance":
+                # Skip significance tests section
+                continue
+            
+            if isinstance(method_data, dict) and "metrics" in method_data:
+                method_info = {
+                    "metrics": method_data["metrics"],
+                }
+                
+                # Add hyperparameters for methods that were trained
+                if "budget" in method_data and method_data["budget"]:
+                    budget = method_data["budget"]
+                    
+                    # Determine if this method was trained
+                    training_source = method_data.get("training_source", "untrained")
+                    
+                    if training_source != "untrained" and "steps" in budget and budget["steps"] > 0:
+                        # Method was trained - include hyperparameters
+                        hyperparameters = {
+                            "learning_rate": self.config.learning_rate,
+                            "batch_size": self.config.batch_size,
+                            "epochs": self.config.epochs,
+                            "max_seq_length": self.config.max_seq_length,
+                            "negatives_per_query": self.config.negatives_per_query,
+                            "temperature": self.config.temperature,
+                        }
+                        
+                        # Add method-specific hyperparameters
+                        if "LoRA" in method_name or "lora" in method_name.lower():
+                            hyperparameters.update({
+                                "lora_rank": self.config.lora_rank,
+                                "lora_alpha": self.config.lora_alpha,
+                                "lora_dropout": self.config.lora_dropout,
+                            })
+                        
+                        if "MAW" in method_name:
+                            hyperparameters.update({
+                                "maw_depth_dim": self.config.maw_depth_dim,
+                                "maw_num_heads": self.config.maw_num_heads,
+                                "maw_layer_indices": self.config.maw_layer_indices,
+                            })
+                        
+                        method_info["hyperparameters"] = hyperparameters
+                        method_info["training_info"] = {
+                            "trained_on": training_source,
+                            "total_parameters": budget.get("total_parameters", 0),
+                            "trainable_parameters": budget.get("trainable_parameters", 0),
+                            "training_steps": budget.get("steps", 0),
+                            "training_tokens": budget.get("tokens", 0),
+                            "wall_clock_sec": budget.get("wall_clock_sec", 0.0),
+                        }
+                    else:
+                        # Method was not trained (zero-shot or baseline)
+                        method_info["training_info"] = {
+                            "trained": False,
+                            "type": "zero-shot" if "ZeroShot" in method_name else "baseline"
+                        }
+                
+                best_results["methods"][method_name] = method_info
+        
+        # Add significance tests if available
+        if "significance" in dataset_report:
+            best_results["significance_tests"] = dataset_report["significance"]
+        
+        # Save to file
+        with best_results_path.open("w") as f:
+            json.dump(best_results, f, indent=2)
+        
+        logging.info("Saved best results to %s", best_results_path)
 
     def _mine_bm25_negatives(
         self,
