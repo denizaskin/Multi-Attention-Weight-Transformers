@@ -127,8 +127,8 @@ class BenchmarkConfig:
     medium_test: bool = False
     smoke_queries: int = 64
     smoke_docs: int = 2000
-    medium_queries: int = 300  # Reduced from 500
-    medium_docs: int = 10000  # Reduced from 50K to avoid OOM
+    medium_queries: int = 1000  # Changed from 300
+    medium_docs: int = 100000  # Changed from 10000
 
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -752,7 +752,7 @@ class GRPOEnvironment:
             (8, 8)
         )
         
-        # Flatten to state vector: (batch, heads * 8 * 8)
+        # Flatten to state vector: (batch, heads*8*8)
         state = pooled.view(batch_size, -1)
         return state
     
