@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import gc
 import json
 import logging
 import math
@@ -123,8 +124,11 @@ class BenchmarkConfig:
     embedding_cache_root: str = "indices/dense"
 
     quick_smoke_test: bool = False
+    medium_test: bool = False
     smoke_queries: int = 64
     smoke_docs: int = 2000
+    medium_queries: int = 300  # Reduced from 500
+    medium_docs: int = 10000  # Reduced from 50K to avoid OOM
 
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -144,6 +148,12 @@ class BenchmarkConfig:
             if f.init:
                 init_params[f.name] = getattr(self, f.name)
         init_params.update(kwargs)
+        
+        # LoRA variants still backprop through large batches of text; use smaller micro-batches to avoid OOM
+        if kwargs.get('use_lora', False) and not kwargs.get('use_maw', False) and 'batch_size' not in kwargs:
+            init_params['batch_size'] = min(self.batch_size, 16)
+            if 'eval_batch_size' not in kwargs:
+                init_params['eval_batch_size'] = min(self.eval_batch_size, 64)
         
         # Optimize batch sizes for MAW variants with multi-GPU support
         if kwargs.get('use_maw', False) and 'batch_size' not in kwargs:
@@ -187,6 +197,13 @@ class BenchmarkConfig:
             self.primary_device_index = -1
             self.device = "cpu"
             self.device_ids = tuple()
+        
+        # Adjust batch sizes for medium test to avoid OOM
+        # Medium test has 50K docs which requires more memory during encoding
+        if self.medium_test and self.batch_size > 32:
+            self.batch_size = 32  # Reduce batch size for medium test
+            if self.eval_batch_size > 64:
+                self.eval_batch_size = 64
 
 
 @dataclass
@@ -454,10 +471,22 @@ class DatasetManager:
                 f"Available splits: {available or 'none'}. Check dataset directory structure."
             )
 
+        # Extract data from splits, then explicitly delete the split tuples
+        # Each split contains a full corpus copy (2.8M docs = ~42GB for LoTTE)
+        # We only need ONE corpus reference, not multiple copies
         corpus = test_split[0]
         train_partition = DatasetPartition(queries=train_split[1], qrels=train_split[2]) if train_split else None
         dev_partition = DatasetPartition(queries=dev_split[1], qrels=dev_split[2]) if dev_split else None
         test_partition = DatasetPartition(queries=test_split[1], qrels=test_split[2])
+        
+        # Delete the split tuples to release their corpus references
+        # Without this, train_split and dev_split hold duplicate corpus copies in memory
+        del test_split
+        if train_split is not None:
+            del train_split
+        if dev_split is not None:
+            del dev_split
+        gc.collect()  # Force garbage collection to release ~80GB for LoTTE (2 corpus copies)
 
         bundle = DatasetBundle(name=dataset, corpus=corpus, train=train_partition, dev=dev_partition, test=test_partition)
         bundle.ensure_test()
@@ -555,8 +584,18 @@ class DatasetManager:
             wait_for_condition(lambda: all(path.exists() for path in required_paths), timeout=1800, interval=5.0)
 
     def _apply_smoke_filters(self, bundle: DatasetBundle) -> DatasetBundle:
-        if not self.config.quick_smoke_test:
+        if not (self.config.quick_smoke_test or self.config.medium_test):
             return bundle
+
+        # Determine target sizes
+        if self.config.quick_smoke_test:
+            target_queries = self.config.smoke_queries
+            target_docs = self.config.smoke_docs
+            test_type = "SMOKE"
+        else:  # medium_test
+            target_queries = self.config.medium_queries
+            target_docs = self.config.medium_docs
+            test_type = "MEDIUM"
 
         rng = random.Random(self.config.seed)
         doc_ids: set[str] = set()
@@ -566,22 +605,26 @@ class DatasetManager:
             if partition is None or partition.is_empty():
                 continue
             original_qids = list(partition.queries.keys())
-            target_queries = min(len(original_qids), self.config.smoke_queries)
-            if target_queries < len(original_qids):
-                selected_qids = set(rng.sample(original_qids, target_queries))
+            num_queries = min(len(original_qids), target_queries)
+            if num_queries < len(original_qids):
+                selected_qids = set(rng.sample(original_qids, num_queries))
                 partition.queries = {qid: partition.queries[qid] for qid in selected_qids}
                 partition.qrels = {qid: partition.qrels[qid] for qid in selected_qids if qid in partition.qrels}
             for docs in partition.qrels.values():
                 doc_ids.update(docs.keys())
 
-        if len(doc_ids) < self.config.smoke_docs:
+        if len(doc_ids) < target_docs:
             remaining = [doc_id for doc_id in bundle.corpus if doc_id not in doc_ids]
             if remaining:
-                extra = min(len(remaining), self.config.smoke_docs - len(doc_ids))
+                extra = min(len(remaining), target_docs - len(doc_ids))
                 doc_ids.update(rng.sample(remaining, extra))
 
         allowed_docs = {doc_id for doc_id in doc_ids if doc_id in bundle.corpus}
-        bundle.corpus = {doc_id: bundle.corpus[doc_id] for doc_id in allowed_docs}
+        # Create filtered corpus and explicitly release the original
+        old_corpus = bundle.corpus
+        bundle.corpus = {doc_id: old_corpus[doc_id] for doc_id in allowed_docs}
+        del old_corpus  # Explicitly delete the original large corpus to free memory
+        gc.collect()  # Force garbage collection to immediately release ~40GB of memory
 
         for split_name in ["train", "dev", "test"]:
             partition = getattr(bundle, split_name)
@@ -597,7 +640,8 @@ class DatasetManager:
             partition.qrels = filtered_qrels
             partition.queries = filtered_queries
             logging.info(
-                "[SMOKE] %s/%s: %d queries | %d docs | %d qrels",
+                "[%s] %s/%s: %d queries | %d docs | %d qrels",
+                test_type,
                 bundle.name,
                 split_name,
                 len(partition.queries),
@@ -1212,7 +1256,11 @@ class HFTextEncoder(nn.Module):
 
     def encode_train(self, texts: List[str], batch_size: Optional[int] = None) -> torch.Tensor:
         if batch_size is None or batch_size <= 0:
-            batch_size = max(len(texts), 1) if len(texts) > 0 else self.config.batch_size
+            batch_size = self.config.batch_size
+        else:
+            # Ensure batch_size doesn't exceed configured batch_size to avoid OOM
+            batch_size = min(batch_size, self.config.batch_size)
+        
         embeddings: List[torch.Tensor] = []
         for start in range(0, len(texts), batch_size):
             batch = texts[start : start + batch_size]
@@ -1263,6 +1311,28 @@ class HFTextEncoder(nn.Module):
         if self.config.device.startswith("cuda"):
             return torch.device(self.config.device)
         return torch.device("cpu")
+
+    def enable_gradient_checkpointing(self) -> None:
+        """
+        Enable gradient checkpointing on the underlying HF model (and wrapped PEFT model if present)
+        to trade compute for memory savings during training.
+        """
+        targets = []
+        model = self.model
+        targets.append(model)
+        base_model = getattr(model, "base_model", None)
+        if base_model is not None and base_model is not model:
+            targets.append(base_model)
+
+        for target in targets:
+            enable_fn = getattr(target, "gradient_checkpointing_enable", None)
+            if callable(enable_fn):
+                enable_fn()
+                config = getattr(target, "config", None)
+                if config is not None:
+                    setattr(config, "gradient_checkpointing", True)
+                    if getattr(config, "use_cache", None):
+                        config.use_cache = False
 
 
 class TripletDataset(Dataset):
@@ -1351,14 +1421,15 @@ class ContrastiveTrainer:
                 shuffle=True,
             )
 
-        max_workers = max(1, min(8, (os.cpu_count() or 1)))
+        # Use num_workers=0 to avoid forking and memory duplication issues
+        # Multiprocessing workers can cause massive memory overhead (8 workers * model size)
         dataloader = DataLoader(
             train_dataset,
             batch_size=self.config.batch_size,
             shuffle=sampler is None,
             drop_last=True,
             sampler=sampler,
-            num_workers=max_workers,
+            num_workers=0,  # Disabled to prevent memory issues
             pin_memory=self.config.device.startswith("cuda"),
         )
         num_training_steps = len(dataloader) * self.config.epochs
@@ -1366,14 +1437,26 @@ class ContrastiveTrainer:
         scheduler = get_linear_schedule_with_warmup(self.optimizer, warmup_steps, num_training_steps)
 
         log_enabled = is_main_process(self.config)
+        
+        # DEBUG: Check if this is MAW training
+        is_maw_training = self.config.use_maw
         if log_enabled:
             logging.info(
-                "[Train:%s] Using %s | batches=%d | epochs=%d",
+                "[Train:%s] Using %s | batches=%d | epochs=%d | MAW=%s",
                 dataset_name,
                 device_status(self.config),
                 len(dataloader),
                 self.config.epochs,
+                is_maw_training,
             )
+            
+            # DEBUG: Log initial model state for MAW
+            if is_maw_training:
+                logging.info("[DEBUG] MAW Training - Checking initial model state...")
+                with torch.no_grad():
+                    test_text = ["This is a test sentence."]
+                    test_emb = self.module.encode(test_text, batch_size=1)
+                    logging.info(f"[DEBUG] Initial test embedding: shape={test_emb.shape}, mean={test_emb.mean():.4f}, std={test_emb.std():.4f}, has_nan={torch.isnan(test_emb).any()}, has_inf={torch.isinf(test_emb).any()}")
 
         self.parallel_model.train()
         best_metric = -1.0
@@ -1400,8 +1483,18 @@ class ContrastiveTrainer:
                 flat_negatives = [neg for neg_list in negative_lists for neg in neg_list]
                 merged_texts = batch_queries + batch_pos + flat_negatives
 
+                # DEBUG: Monitor first batch of MAW training
+                if is_maw_training and log_enabled and batch_idx == 0 and epoch == 0:
+                    logging.info(f"[DEBUG] First batch: {len(batch_queries)} queries, {len(merged_texts)} total texts")
+
                 with self._autocast_context():
-                    embeddings = self.parallel_model(merged_texts, chunk_size=len(merged_texts))
+                    # Don't pass chunk_size - let encode_train use the configured batch_size
+                    # to avoid OOM when merged_texts is large (e.g., 32 queries * 6 texts each = 192)
+                    embeddings = self.parallel_model(merged_texts)
+                    
+                # DEBUG: Check embeddings after encoding
+                if is_maw_training and log_enabled and batch_idx == 0 and epoch == 0:
+                    logging.info(f"[DEBUG] Embeddings: shape={embeddings.shape}, mean={embeddings.mean():.4f}, std={embeddings.std():.4f}, has_nan={torch.isnan(embeddings).any()}, has_inf={torch.isinf(embeddings).any()}")
 
                 num_queries = len(batch_queries)
                 num_pos = len(batch_pos)
@@ -1414,8 +1507,20 @@ class ContrastiveTrainer:
                 doc_emb = torch.cat([pos_emb, neg_emb], dim=0) if neg_emb.numel() else pos_emb
                 logits = torch.matmul(query_emb, doc_emb.t()) / self.config.temperature
                 logits = logits.float()
+                
+                # DEBUG: Check logits
+                if is_maw_training and log_enabled and batch_idx == 0 and epoch == 0:
+                    logging.info(f"[DEBUG] Logits: shape={logits.shape}, mean={logits.mean():.4f}, std={logits.std():.4f}, min={logits.min():.4f}, max={logits.max():.4f}")
+                    # Check if positive docs are actually ranked higher
+                    pos_scores = logits.diag()
+                    logging.info(f"[DEBUG] Positive scores (diagonal): mean={pos_scores.mean():.4f}, min={pos_scores.min():.4f}, max={pos_scores.max():.4f}")
+                
                 labels = torch.arange(logits.size(0), device=query_emb.device)
                 loss = F.cross_entropy(logits, labels)
+                
+                # DEBUG: Check loss
+                if is_maw_training and log_enabled and batch_idx == 0 and epoch == 0:
+                    logging.info(f"[DEBUG] Loss: {loss.item():.4f}")
                 
                 # Scale loss by accumulation steps to average gradients
                 loss = loss / self.config.gradient_accumulation_steps
@@ -1447,6 +1552,20 @@ class ContrastiveTrainer:
                 self.tokens_processed += token_count
                 if log_enabled:
                     progress.set_postfix({"loss": loss.item(), "step": self.global_step})
+                
+                # DEBUG: Check gradients for MAW after first batch
+                if is_maw_training and log_enabled and batch_idx == 0 and epoch == 0 and accumulation_step % self.config.gradient_accumulation_steps == 0:
+                    total_grad_norm = 0.0
+                    num_params_with_grad = 0
+                    for name, param in self.parallel_model.named_parameters():
+                        if param.grad is not None:
+                            grad_norm = param.grad.norm().item()
+                            total_grad_norm += grad_norm ** 2
+                            num_params_with_grad += 1
+                            if 'maw' in name.lower() or 'grpo' in name.lower() or 'policy' in name.lower():
+                                logging.info(f"[DEBUG] Gradient for {name}: norm={grad_norm:.6f}, mean={param.grad.mean():.6f}")
+                    total_grad_norm = total_grad_norm ** 0.5
+                    logging.info(f"[DEBUG] Total gradient norm: {total_grad_norm:.4f} ({num_params_with_grad} params with gradients)")
 
             if dev_partition is not None and not dev_partition.is_empty():
                 if log_enabled:
@@ -1470,6 +1589,19 @@ class ContrastiveTrainer:
             self.module.load_state_dict(synced_state)
 
         self.parallel_model.eval()
+        
+        # DEBUG: Test model after training for MAW
+        if is_maw_training and log_enabled:
+            logging.info("[DEBUG] MAW Training Complete - Testing trained model...")
+            with torch.no_grad():
+                test_queries = ["machine learning", "deep learning"]
+                test_docs = ["Machine learning is AI", "Python programming"]
+                query_embs = self.module.encode(test_queries, batch_size=8)
+                doc_embs = self.module.encode(test_docs, batch_size=8)
+                similarities = torch.matmul(query_embs, doc_embs.t())
+                logging.info(f"[DEBUG] After training - Query embeddings: mean={query_embs.mean():.4f}, std={query_embs.std():.4f}, has_nan={torch.isnan(query_embs).any()}, has_inf={torch.isinf(query_embs).any()}")
+                logging.info(f"[DEBUG] After training - Doc embeddings: mean={doc_embs.mean():.4f}, std={doc_embs.std():.4f}, has_nan={torch.isnan(doc_embs).any()}, has_inf={torch.isinf(doc_embs).any()}")
+                logging.info(f"[DEBUG] After training - Similarities:\n{similarities.cpu().numpy()}")
 
         wall_clock = time.time() - self.wall_clock_start
         total_tokens = self.tokens_processed
@@ -1576,6 +1708,17 @@ class EvaluationManager:
 
         previous_mode = encoder.training
         encoder.eval()
+        
+        log_enabled = is_main_process(self.config)
+        
+        # DEBUG: Check if evaluating MAW model
+        is_maw_eval = hasattr(encoder.config, 'use_maw') and encoder.config.use_maw
+        if is_maw_eval and log_enabled:
+            logging.info(f"[DEBUG] Starting evaluation of MAW model for {dataset_id}/{split}")
+            # Test encode before corpus preparation
+            with torch.no_grad():
+                test_emb = encoder.encode(["test"], batch_size=1)
+                logging.info(f"[DEBUG] Eval test embedding: mean={test_emb.mean():.4f}, has_nan={torch.isnan(test_emb).any()}, has_inf={torch.isinf(test_emb).any()}")
 
         corpus_embeddings = self._prepare_corpus_embeddings(encoder, cache_prefix, doc_ids, corpus)
 
@@ -1583,7 +1726,6 @@ class EvaluationManager:
         if self.config.distributed and dist.is_available() and dist.is_initialized():
             query_pairs = query_pairs[self.config.rank :: self.config.world_size]
 
-        log_enabled = is_main_process(self.config)
         local_results: Dict[str, Dict[str, float]] = {}
         
         # Use encoder's config for batch size (MAW may have different settings)
@@ -1605,9 +1747,18 @@ class EvaluationManager:
                     batch_embeddings = encoder.encode(batch_texts, batch_size=query_batch_size)
             else:
                 batch_embeddings = encoder.encode(batch_texts, batch_size=query_batch_size)
+            
+            # DEBUG: Check query embeddings for MAW
+            if is_maw_eval and log_enabled and start == 0:
+                logging.info(f"[DEBUG] First query batch embeddings: shape={batch_embeddings.shape}, mean={batch_embeddings.mean():.4f}, std={batch_embeddings.std():.4f}, has_nan={torch.isnan(batch_embeddings).any()}, has_inf={torch.isinf(batch_embeddings).any()}")
+            
             if batch_embeddings.numel() == 0:
                 continue
             scores, indices = self._search_corpus(batch_embeddings, corpus_embeddings, top_k)
+            
+            # DEBUG: Check scores for MAW
+            if is_maw_eval and log_enabled and start == 0:
+                logging.info(f"[DEBUG] First query batch scores: shape={scores.shape}, mean={scores.mean():.4f}, std={scores.std():.4f}, min={scores.min():.4f}, max={scores.max():.4f}")
             scores_np = scores.numpy()
             indices_np = indices.numpy()
             for row, qid in enumerate(batch_ids):
@@ -1661,6 +1812,20 @@ class EvaluationManager:
     ) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
         if not qrels:
             return self._empty_metrics(), {}
+        
+        # DEBUG: Check qrels and results structure
+        log_enabled = is_main_process(self.config)
+        if log_enabled:
+            logging.info(f"[DEBUG METRICS] qrels: {len(qrels)} queries")
+            logging.info(f"[DEBUG METRICS] results: {len(results)} queries")
+            if qrels:
+                sample_qid = list(qrels.keys())[0]
+                logging.info(f"[DEBUG METRICS] Sample qrel: qid={sample_qid}, relevant_docs={list(qrels[sample_qid].keys())[:3]}")
+            if results:
+                sample_qid = list(results.keys())[0]
+                top_docs = sorted(results[sample_qid].items(), key=lambda x: x[1], reverse=True)[:5]
+                logging.info(f"[DEBUG METRICS] Sample result: qid={sample_qid}, top_5_docs={[(d, f'{s:.4f}') for d, s in top_docs]}")
+        
         metrics_map = ["map_cut_100", "ndcg_cut_10", "ndcg_cut_100", "recall_100", "recall_1000", "recall_10"]
         evaluator = pytrec_eval.RelevanceEvaluator(qrels, metrics_map)
         per_query = evaluator.evaluate(results)
@@ -1975,6 +2140,11 @@ class BenchmarkRunner:
                 hard_negatives = self._mine_bm25_negatives(bm25, bundle.train.queries, bundle.train.qrels, negative_depth)
             hard_negatives = broadcast_object(self.config, hard_negatives)
 
+        if self.config.device.startswith("cuda"):
+            allocated_before = torch.cuda.memory_allocated(0) / 1024**3
+            reserved_before = torch.cuda.memory_reserved(0) / 1024**3
+            logging.info(f"[MEMORY:Before DenseZeroShot Eval] Allocated={allocated_before:.2f}GB, Reserved={reserved_before:.2f}GB")
+        
         baseline_metrics, baseline_per_query = self.evaluator.evaluate_dense_model(
             dataset_name,
             self.base_encoder,
@@ -1984,6 +2154,12 @@ class BenchmarkRunner:
             split="test",
             cache_prefix=f"{dataset_name}/DenseZeroShot",
         )
+        
+        if self.config.device.startswith("cuda"):
+            allocated_after = torch.cuda.memory_allocated(0) / 1024**3
+            reserved_after = torch.cuda.memory_reserved(0) / 1024**3
+            logging.info(f"[MEMORY:After DenseZeroShot Eval] Allocated={allocated_after:.2f}GB, Reserved={reserved_after:.2f}GB")
+        
         if log_enabled:
             logging.info(
                 "[Eval:%s] DenseZeroShot completed on %s",
@@ -1994,9 +2170,27 @@ class BenchmarkRunner:
                 "metrics": baseline_metrics,
                 "budget": compile_budget_report("DenseZeroShot", self.base_encoder),
             }
+        
+        # Move base_encoder to CPU and aggressively clear GPU memory after DenseZeroShot evaluation
+        # This frees space for training variants which will load their own models
+        if self.config.device.startswith("cuda"):
+            # Move model to CPU
+            self.base_encoder.model.to("cpu")
+            # Force garbage collection and CUDA cache cleanup
+            gc.collect()
+            torch.cuda.empty_cache()
+            # Synchronize to ensure memory is freed before next model loads
+            torch.cuda.synchronize()
+            # Check memory after cleanup
+            allocated_cleaned = torch.cuda.memory_allocated(0) / 1024**3
+            reserved_cleaned = torch.cuda.memory_reserved(0) / 1024**3
+            logging.info(f"[MEMORY:After Cleanup] Allocated={allocated_cleaned:.2f}GB, Reserved={reserved_cleaned:.2f}GB")
 
         train_dataset: Optional[TripletDataset] = None
         if bundle.has_train():
+            logging.info(f"[DEBUG] Creating TripletDataset with corpus size: {len(bundle.corpus)} docs")
+            logging.info(f"[DEBUG] bundle.train.queries: {len(bundle.train.queries)}, bundle.train.qrels: {len(bundle.train.qrels)}")
+            
             candidate_dataset = TripletDataset(
                 bundle.train.queries,
                 bundle.train.qrels,
@@ -2031,6 +2225,13 @@ class BenchmarkRunner:
             per_query_scores["DenseZeroShot"] = baseline_per_query
 
         for label, variant_cfg in variant_specs.items():
+            if self.config.device.startswith("cuda"):
+                # Check memory on ALL GPUs, not just GPU 0
+                for gpu_id in range(torch.cuda.device_count()):
+                    allocated = torch.cuda.memory_allocated(gpu_id) / 1024**3
+                    reserved = torch.cuda.memory_reserved(gpu_id) / 1024**3
+                    logging.info(f"[MEMORY:Before {label} GPU{gpu_id}] Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+            
             encoder, training_stats, source = self._prepare_variant_model(
                 label,
                 variant_cfg,
@@ -2062,9 +2263,16 @@ class BenchmarkRunner:
                 }
                 per_query_scores[label] = per_query
 
+            # Free GPU memory after each variant
+            # Need aggressive cleanup like DenseZeroShot to prevent accumulation
             if self.config.device.startswith("cuda"):
                 encoder.model.to("cpu")
+                del encoder
+                # Force garbage collection before emptying cache
+                gc.collect()
                 torch.cuda.empty_cache()
+                # Synchronize to ensure memory is freed before next variant loads
+                torch.cuda.synchronize()
 
         if log_enabled:
             sig_tests: Dict[str, Dict[str, float]] = {}
@@ -2210,12 +2418,28 @@ class BenchmarkRunner:
         train_dataset: Optional[TripletDataset],
         bundle: DatasetBundle,
     ) -> Tuple[HFTextEncoder, Dict[str, Any], str]:
+        if torch.cuda.is_available() and variant_cfg.device.startswith("cuda"):
+            for gpu_id in range(torch.cuda.device_count()):
+                with torch.cuda.device(gpu_id):
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            gc.collect()
+
         has_training_data = train_dataset is not None and len(train_dataset) > 0
 
         if has_training_data:
             encoder = HFTextEncoder(variant_cfg)
+            if not variant_cfg.use_lora:
+                encoder.enable_gradient_checkpointing()
             if variant_cfg.use_lora:
                 encoder.freeze_base()
+            
+            if variant_cfg.device.startswith("cuda"):
+                for gpu_id in range(torch.cuda.device_count()):
+                    allocated = torch.cuda.memory_allocated(gpu_id) / 1024**3
+                    reserved = torch.cuda.memory_reserved(gpu_id) / 1024**3
+                    logging.info(f"[MEMORY:After {label} Encoder Init GPU{gpu_id}] Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB")
+            
             trainer = ContrastiveTrainer(encoder, variant_cfg)
             training_stats = trainer.train(dataset_name, train_dataset, bundle.corpus, bundle.dev, self.evaluator)
             snapshot = self._store_snapshot(label, dataset_name, encoder, training_stats)
@@ -2287,7 +2511,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--msmarco", action="store_true", help="Include MS MARCO evaluation")
     # REMOVED: --beir argument - BEIR datasets don't have train sets
     parser.add_argument("--lotte", nargs="*", default=[], help="LoTTE splits (search/forum)")
-    parser.add_argument("--quick-smoke-test", action="store_true", help="Run tiny smoke test subset")
+    parser.add_argument("--quick-smoke-test", action="store_true", help="Run tiny smoke test subset (64 queries, 2K docs, ~5 min)")
+    parser.add_argument("--medium-test", action="store_true", help="Run medium test subset (500 queries, 50K docs, ~20-30 min)")
     parser.add_argument("--skip-bm25", action="store_true", help="Skip BM25 baseline evaluation (saves time on large datasets)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--lora-rank", type=int, default=16)
@@ -2331,6 +2556,7 @@ def build_config(args: argparse.Namespace) -> BenchmarkConfig:
         lotte_splits=args.lotte,
         skip_bm25=args.skip_bm25,
         quick_smoke_test=args.quick_smoke_test,
+        medium_test=args.medium_test,
         seed=args.seed,
         lora_rank=args.lora_rank,
         lora_alpha=args.lora_alpha,

@@ -66,6 +66,12 @@ datasets/
 *.json
 *.tsv
 
+# Embedding caches and indices
+indices/
+*.memmap
+*.npy
+*.npz
+
 # Results
 results/
 outputs/
